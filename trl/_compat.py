@@ -178,6 +178,7 @@ def _patch_transformers_hybrid_cache() -> None:
     """
     if _is_package_version_at_least("transformers", "5.0.0") and _is_package_version_below("peft", "0.18.0"):
         try:
+            import transformers
             import transformers.cache_utils
             from transformers.utils.import_utils import _LazyModule
 
@@ -185,6 +186,16 @@ def _patch_transformers_hybrid_cache() -> None:
 
             # Patch for liger_kernel: Add HybridCache as an alias for Cache in the cache_utils module
             transformers.cache_utils.HybridCache = Cache
+
+            # Patch for peft: expose HybridCache at transformers top-level for direct import
+            transformers.HybridCache = Cache
+            if hasattr(transformers, "_class_to_module"):
+                transformers._class_to_module["HybridCache"] = "cache_utils"
+            if hasattr(transformers, "_import_structure") and "cache_utils" in transformers._import_structure:
+                if "HybridCache" not in transformers._import_structure["cache_utils"]:
+                    transformers._import_structure["cache_utils"].append("HybridCache")
+            if hasattr(transformers, "__all__") and "HybridCache" not in transformers.__all__:
+                transformers.__all__.append("HybridCache")
 
             # Patch for peft: Patch _LazyModule.__init__ to add HybridCache to transformers' lazy loading structures
             _original_lazy_module_init = _LazyModule.__init__

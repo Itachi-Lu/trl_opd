@@ -100,6 +100,24 @@ class GKDConfig(SFTConfig):
             "FT on teacher-generated output)."
         },
     )
+    rollout_debug: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to print decoded on-policy rollout samples during training (rank 0 only)."
+        },
+    )
+    rollout_debug_steps: int = field(
+        default=50,
+        metadata={
+            "help": "Print rollout samples every N global steps when rollout_debug is enabled."
+        },
+    )
+    rollout_debug_num_samples: int = field(
+        default=1,
+        metadata={
+            "help": "How many decoded rollout samples to print at each debug logging step."
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -108,3 +126,7 @@ class GKDConfig(SFTConfig):
             raise ValueError("lmbda must be in the range [0.0, 1.0].")
         if self.beta < 0.0 or self.beta > 1.0:
             raise ValueError("beta must be in the range [0.0, 1.0].")
+        if self.rollout_debug_steps <= 0:
+            raise ValueError("rollout_debug_steps must be > 0.")
+        if self.rollout_debug_num_samples <= 0:
+            raise ValueError("rollout_debug_num_samples must be > 0.")

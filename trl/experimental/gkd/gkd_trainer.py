@@ -131,7 +131,9 @@ class GKDTrainer(SFTTrainer):
         args.remove_unused_columns = False
         # Respect a user-provided data_collator; otherwise, provide a ChatML collator that
         if data_collator is None:
-            data_collator = DataCollatorForChatML(tokenizer=processing_class, max_length=args.max_length)
+            data_collator = DataCollatorForChatML(
+                tokenizer=processing_class, max_length=args.max_length
+            )
 
         # Ensure SFTTrainer does not pre-process the dataset when using a ChatML collator,
         # so that raw conversational fields (e.g., "messages") remain available to the collator.
@@ -196,6 +198,10 @@ class GKDTrainer(SFTTrainer):
         self.beta = args.beta
         self.temperature = args.temperature
         self.seq_kd = args.seq_kd
+        self.rollout_debug = args.rollout_debug
+        self.rollout_debug_steps = args.rollout_debug_steps
+        self.rollout_debug_num_samples = args.rollout_debug_num_samples
+        self._last_rollout_debug_step = -1
 
         generation_kwargs = {
             "max_new_tokens": args.max_new_tokens,
@@ -413,6 +419,53 @@ class GKDTrainer(SFTTrainer):
 
         return generated_tokens, new_attention_mask, new_labels
 
+    def _maybe_log_rollout_samples(
+        self,
+        prompt_input_ids: torch.Tensor | None,
+        prompt_attention_mask: torch.Tensor | None,
+        generated_input_ids: torch.Tensor,
+        source: str,
+    ) -> None:
+        if not self.rollout_debug:
+            return
+        if not self.accelerator.is_main_process:
+            return
+
+        step = int(self.state.global_step)
+        if step % self.rollout_debug_steps != 0:
+            return
+        if step == self._last_rollout_debug_step:
+            return
+
+        num_samples = min(self.rollout_debug_num_samples, generated_input_ids.shape[0])
+        if num_samples <= 0:
+            return
+
+        selected_generated = generated_input_ids[:num_samples].detach().cpu()
+        full_texts = self.processing_class.batch_decode(selected_generated, skip_special_tokens=True)
+
+        prompt_texts = [""] * num_samples
+        completion_texts = [""] * num_samples
+        if prompt_input_ids is not None:
+            selected_prompts = prompt_input_ids[:num_samples].detach().cpu()
+            prompt_texts = self.processing_class.batch_decode(selected_prompts, skip_special_tokens=True)
+
+            for i in range(num_samples):
+                if prompt_attention_mask is not None:
+                    prompt_len = int(prompt_attention_mask[i].sum().item())
+                else:
+                    prompt_len = selected_prompts.shape[1]
+                completion_ids = selected_generated[i][prompt_len:]
+                completion_texts[i] = self.processing_class.decode(completion_ids, skip_special_tokens=True)
+
+        print(f"[rollout_debug] step={step} source={source} samples={num_samples}", flush=True)
+        for i in range(num_samples):
+            print(f"[rollout_debug][sample={i}] prompt: {prompt_texts[i]}", flush=True)
+            print(f"[rollout_debug][sample={i}] completion: {completion_texts[i]}", flush=True)
+            print(f"[rollout_debug][sample={i}] full: {full_texts[i]}", flush=True)
+
+        self._last_rollout_debug_step = step
+
     def training_step(
         self, model: nn.Module, inputs: dict[str, torch.Tensor | Any], num_items_in_batch: int | None = None
     ) -> torch.Tensor:
@@ -434,6 +487,12 @@ class GKDTrainer(SFTTrainer):
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
                     unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                 )
+            self._maybe_log_rollout_samples(
+                inputs.get("prompts", None),
+                inputs.get("prompt_attention_mask", None),
+                new_input_ids,
+                source="teacher_seq_kd",
+            )
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels
@@ -448,6 +507,12 @@ class GKDTrainer(SFTTrainer):
                 new_input_ids, new_attention_mask, new_labels = self.generate_on_policy_outputs(
                     unwrapped_model, inputs, self.generation_config, self.processing_class.pad_token_id
                 )
+            self._maybe_log_rollout_samples(
+                inputs.get("prompts", None),
+                inputs.get("prompt_attention_mask", None),
+                new_input_ids,
+                source="student_on_policy",
+            )
             inputs["input_ids"] = new_input_ids
             inputs["attention_mask"] = new_attention_mask
             inputs["labels"] = new_labels

@@ -14,7 +14,6 @@
 
 import math
 import textwrap
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -365,8 +364,7 @@ class MiniLLMTrainer(GRPOTrainer):
         student_logits: torch.Tensor,
         teacher_log_probs: torch.Tensor,
         mask: torch.Tensor,
-        return_stats: bool = False,
-    ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    ) -> torch.Tensor:
         teacher_probs = teacher_log_probs.exp()
         vocab_size = teacher_probs.size(-1)
         entropy_scale = math.log(vocab_size) if vocab_size > 1 else 1.0
@@ -382,103 +380,8 @@ class MiniLLMTrainer(GRPOTrainer):
         valid_count = mask_float.sum().clamp(min=1.0)
         mean_gate = (raw_gate * mask_float).sum() / valid_count
         normalized_gate = raw_gate / (mean_gate + 1e-6)
-        low_clipped = normalized_gate < self.gate_weight_min
-        high_clipped = normalized_gate > self.gate_weight_max
-        clipped_gate = normalized_gate.clamp(min=self.gate_weight_min, max=self.gate_weight_max)
-        final_gate = clipped_gate * mask_float
-
-        if not return_stats:
-            return final_gate
-
-        stats = {
-            "teacher_entropy": teacher_entropy,
-            "teacher_gate": teacher_gate,
-            "student_gate": teacher_topk_mass,
-            "dual_gate_raw": raw_gate,
-            "dual_gate_final": clipped_gate,
-            "dual_gate_low_clipped": low_clipped.float(),
-            "dual_gate_high_clipped": high_clipped.float(),
-        }
-        return final_gate, stats
-
-    def _write_sample_rollout_file(self, checkpoint_dir: Path) -> None:
-        sample_path = checkpoint_dir / "sample_rollout.txt"
-        logs = getattr(self, "_logs", {})
-        prompts = logs.get("prompt", [])
-        prompts_with_special_tokens = logs.get("prompt_with_special_tokens", [])
-        completions = logs.get("completion", [])
-        completions_with_special_tokens = logs.get("completion_with_special_tokens", [])
-
-        if len(prompts) == 0 or len(completions) == 0:
-            sample_path.write_text("No rollout sample available at checkpoint time.\n", encoding="utf-8")
-            return
-
-        sample_idx = len(prompts) - 1
-
-        def format_value(value):
-            if isinstance(value, float):
-                return f"{value:.6f}"
-            if isinstance(value, list):
-                if value and isinstance(value[0], list):
-                    return "\n".join(str(item) for item in value)
-                return ", ".join(str(item) for item in value)
-            return str(value)
-
-        prompt = prompts[sample_idx]
-        prompt_with_special_tokens = (
-            prompts_with_special_tokens[sample_idx] if len(prompts_with_special_tokens) > sample_idx else None
-        )
-        completion = completions[sample_idx]
-        completion_with_special_tokens = (
-            completions_with_special_tokens[sample_idx]
-            if len(completions_with_special_tokens) > sample_idx
-            else None
-        )
-        advantages = logs.get("advantages", [])
-        advantage = advantages[sample_idx] if len(advantages) > sample_idx else "N/A"
-
-        lines = [
-            f"step: {self.state.global_step}",
-            f"checkpoint: {checkpoint_dir.name}",
-            "",
-            "prompt",
-            "------",
-            format_value(prompt),
-            "",
-            "prompt_with_special_tokens",
-            "--------------------------",
-            format_value(prompt_with_special_tokens if prompt_with_special_tokens is not None else "N/A"),
-            "",
-            "completion",
-            "----------",
-            format_value(completion),
-            "",
-            "completion_with_special_tokens",
-            "------------------------------",
-            format_value(completion_with_special_tokens if completion_with_special_tokens is not None else "N/A"),
-            "",
-            "advantage",
-            "---------",
-            format_value(advantage),
-        ]
-
-        rewards = logs.get("rewards", {})
-        if rewards:
-            lines.extend(["", "rewards", "-------"])
-            for name, values in rewards.items():
-                if len(values) > sample_idx:
-                    lines.append(f"{name}: {format_value(values[sample_idx])}")
-
-        extra = logs.get("extra", {})
-        if extra:
-            extra_lines = []
-            for name, values in extra.items():
-                if len(values) > sample_idx:
-                    extra_lines.append(f"{name}: {format_value(values[sample_idx])}")
-            if extra_lines:
-                lines.extend(["", "extra", "-----", *extra_lines])
-
-        sample_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        normalized_gate = normalized_gate.clamp(min=self.gate_weight_min, max=self.gate_weight_max)
+        return normalized_gate * mask_float
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         input_ids = torch.cat([inputs["prompt_ids"], inputs["completion_ids"]], dim=1)
@@ -523,29 +426,8 @@ class MiniLLMTrainer(GRPOTrainer):
             )
 
             if self.use_dual_gate:
-                dual_gate, gate_stats = self._compute_dual_gate(
-                    student_logits, teacher_log_probs, mask, return_stats=True
-                )
+                dual_gate = self._compute_dual_gate(student_logits, teacher_log_probs, mask)
                 reverse_kl_advantage = reverse_kl_advantage * dual_gate
-
-                mode = "train" if self.model.training else "eval"
-                mask_float = mask.float()
-                valid_count = mask_float.sum().clamp(min=1.0)
-
-                def masked_mean(x: torch.Tensor) -> torch.Tensor:
-                    return (x * mask_float).sum() / valid_count
-
-                metric_tensors = {
-                    "teacher_entropy/mean": masked_mean(gate_stats["teacher_entropy"]),
-                    "teacher_gate/mean": masked_mean(gate_stats["teacher_gate"]),
-                    "student_gate/mean": masked_mean(gate_stats["student_gate"]),
-                    "dual_gate/raw_mean": masked_mean(gate_stats["dual_gate_raw"]),
-                    "dual_gate/mean": masked_mean(gate_stats["dual_gate_final"]),
-                    "dual_gate/clipped_low_ratio": masked_mean(gate_stats["dual_gate_low_clipped"]),
-                    "dual_gate/clipped_high_ratio": masked_mean(gate_stats["dual_gate_high_clipped"]),
-                }
-                for name, value in metric_tensors.items():
-                    self._metrics[mode][name].append(self.accelerator.gather(value).nanmean().item())
 
             inputs["advantages"] = inputs["advantages"].unsqueeze(1) + reverse_kl_advantage
 
@@ -567,14 +449,4 @@ class MiniLLMTrainer(GRPOTrainer):
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
-
-    def _save_checkpoint(self, model, trial):
-        super()._save_checkpoint(model, trial)
-
-        if not self.accelerator.is_main_process:
-            return
-
-        checkpoint_dir = Path(self.args.output_dir) / f"checkpoint-{self.state.global_step}"
-        if checkpoint_dir.exists():
-            self._write_sample_rollout_file(checkpoint_dir)
 

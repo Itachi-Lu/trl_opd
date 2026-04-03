@@ -143,3 +143,36 @@ checklink/cookies.txt
 nbs/wandb/
 examples/notebooks/wandb/
 wandb/
+
+# Training outputs and checkpoints in fan directory
+fan/opd/outputs/
+fan/SFT/output/
+fan/SFT/output_qwen3_1_7base_capybara/
+fan/SFT/output_token_stats_capybara/
+fan/SFT/trash/
+fan/SFT/eval_out/details/
+fan/SFT/eval_out/results/
+fan/gkd/gkd-model/
+fan/gkd/mlruns/
+fan/gkd_opd/gkd-opd-qwen3/
+fan/gkd_opd/gkd-opd-qwen3-multigpu/
+fan/Qwen2.5-0.5B-SFT/
+fan/mlruns/
+fan/swanlog/
+
+# Model weight files
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.ckpt
+
+# Optimizer states
+optimizer.pt
+rng_state*.pth
+scheduler.pt
+
+# Large tokenizer files (usually can be downloaded from hub)
+merges.txt
+vocab.json
+tokenizer.json

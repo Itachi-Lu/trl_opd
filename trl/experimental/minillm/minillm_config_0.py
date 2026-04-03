@@ -45,16 +45,6 @@ class MiniLLMConfig(GRPOConfig):
             Discount factor for future rewards in reinforcement learning.
         length_normalization (`bool`, *optional*, defaults to `True`):
             Whether to apply length normalization to the rewards.
-        use_dual_gate (`bool`, *optional*, defaults to `False`):
-            Whether to apply dual teacher/student token gating to the distillation advantage.
-        gate_teacher_entropy_lambda (`float`, *optional*, defaults to `2.0`):
-            Entropy penalty strength for the teacher reliability gate.
-        gate_student_topk (`int`, *optional*, defaults to `32`):
-            Top-k size used to estimate whether the teacher's probability mass lies in the student's learnable region.
-        gate_weight_min (`float`, *optional*, defaults to `0.2`):
-            Lower clip bound applied after gate re-normalization.
-        gate_weight_max (`float`, *optional*, defaults to `2.0`):
-            Upper clip bound applied after gate re-normalization.
     """
 
     _VALID_DICT_FIELDS = GRPOConfig._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
@@ -92,27 +82,6 @@ class MiniLLMConfig(GRPOConfig):
     length_normalization: bool = field(
         default=True,
         metadata={"help": "Whether to apply length normalization to the rewards."},
-    )
-
-    use_dual_gate: bool = field(
-        default=False,
-        metadata={"help": "Whether to apply dual teacher/student token gating to the distillation advantage."},
-    )
-    gate_teacher_entropy_lambda: float = field(
-        default=2.0,
-        metadata={"help": "Entropy penalty strength for the teacher reliability gate."},
-    )
-    gate_student_topk: int = field(
-        default=32,
-        metadata={"help": "Top-k size used to estimate whether the teacher's mass lies in the student's learnable region."},
-    )
-    gate_weight_min: float = field(
-        default=0.2,
-        metadata={"help": "Lower clip bound applied after gate re-normalization."},
-    )
-    gate_weight_max: float = field(
-        default=2.0,
-        metadata={"help": "Upper clip bound applied after gate re-normalization."},
     )
 
     def __post_init__(self):
@@ -169,4 +138,3 @@ class MiniLLMConfig(GRPOConfig):
 
         if self.delta is not None and self.use_liger_kernel:
             raise ValueError("Liger kernel does not support two-sided GRPO loss yet.")
-

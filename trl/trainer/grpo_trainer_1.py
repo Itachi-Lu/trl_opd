@@ -329,8 +329,6 @@ class GRPOTrainer(_BaseTrainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
-        self.terminal_token_ids = list(dict.fromkeys([self.eos_token_id, self.pad_token_id]))
-        self._terminal_token_id_set = set(self.terminal_token_ids)
 
         if is_peft_available() and is_peft_model(model) and peft_config is not None:
             raise ValueError(
@@ -712,9 +710,7 @@ class GRPOTrainer(_BaseTrainer):
         self._logs = {
             "images": deque(maxlen=args.generation_batch_size),
             "prompt": deque(maxlen=args.generation_batch_size),
-            "prompt_with_special_tokens": deque(maxlen=args.generation_batch_size),
             "completion": deque(maxlen=args.generation_batch_size),
-            "completion_with_special_tokens": deque(maxlen=args.generation_batch_size),
             "rewards": defaultdict(lambda: deque(maxlen=args.generation_batch_size)),
             "advantages": deque(maxlen=args.generation_batch_size),
         }
@@ -766,7 +762,7 @@ class GRPOTrainer(_BaseTrainer):
                 "do_sample": True,
                 "pad_token_id": tokenizer.pad_token_id,
                 "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": self.terminal_token_ids if len(self.terminal_token_ids) > 1 else self.eos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
                 "temperature": self.temperature,
                 "top_p": self.top_p,
                 "top_k": self.top_k,
@@ -1089,15 +1085,6 @@ class GRPOTrainer(_BaseTrainer):
             self._current_train_step_time = 0.0
         return output
 
-    def _get_terminal_token_mask(self, token_ids: torch.Tensor) -> torch.Tensor:
-        is_terminal = torch.zeros_like(token_ids, dtype=torch.bool)
-        for token_id in self.terminal_token_ids:
-            is_terminal |= token_ids == token_id
-        return is_terminal
-
-    def _is_terminated_completion(self, token_ids: list[int]) -> bool:
-        return bool(token_ids) and token_ids[-1] in self._terminal_token_id_set
-
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
@@ -1341,11 +1328,11 @@ class GRPOTrainer(_BaseTrainer):
             prompt_length = prompt_ids_tensor.size(1)
             completion_ids = prompt_completion_ids[:, prompt_length:]
 
-            # Mask everything after the first terminal token.
-            is_terminal = self._get_terminal_token_mask(completion_ids)
-            eos_idx = torch.full((is_terminal.size(0),), is_terminal.size(1), dtype=torch.long, device=device)
-            eos_idx[is_terminal.any(dim=1)] = is_terminal.int().argmax(dim=1)[is_terminal.any(dim=1)]
-            sequence_indices = torch.arange(is_terminal.size(1), device=device).expand(is_terminal.size(0), -1)
+            # Mask everything after the first EOS token
+            is_eos = completion_ids == self.eos_token_id
+            eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
+            eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
+            sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
             completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
             # Move tensors to CPU before per-sample to avoid many CUDA syncs/copies (costly at scale/contention).
             prompt_ids = [
@@ -1610,11 +1597,9 @@ class GRPOTrainer(_BaseTrainer):
         self._metrics[mode]["completions/min_length"].append(agg_completion_lengths.float().min().item())
         self._metrics[mode]["completions/max_length"].append(agg_completion_lengths.float().max().item())
 
-        # Identify sequences that terminated with one of the configured terminal tokens and log their lengths.
-        is_truncated = torch.tensor(
-            [not self._is_terminated_completion(ids) for ids in completion_ids],
-            device=device,
-        )
+        # Identify sequences that terminated with EOS and log their lengths
+        eos_and_pad = [self.eos_token_id, self.pad_token_id]
+        is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids], device=device)
         agg_is_truncated = self.accelerator.gather(is_truncated)
         self._metrics[mode]["completions/clipped_ratio"].append(agg_is_truncated.float().mean().item())
         term_completion_lengths = agg_completion_lengths[~agg_is_truncated]
@@ -1738,10 +1723,8 @@ class GRPOTrainer(_BaseTrainer):
 
         # If mask_truncated_completions is enabled, zero out truncated completions for attention and loss masking
         if self.mask_truncated_completions:
-            is_truncated = torch.tensor(
-                [not self._is_terminated_completion(ids) for ids in completion_ids_list],
-                device=device,
-            )
+            eos_and_pad = [self.eos_token_id, self.pad_token_id]
+            is_truncated = torch.tensor([ids[-1] not in eos_and_pad for ids in completion_ids_list], device=device)
             # Mask completion_mask for attention masking
             completion_mask = completion_mask * (~is_truncated).unsqueeze(1).int()
             # Also mask tool_mask for consistency in multi-turn training
@@ -1889,11 +1872,7 @@ class GRPOTrainer(_BaseTrainer):
 
         # Decode
         prompts_text = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=True)
-        prompts_text_with_special_tokens = self.processing_class.batch_decode(prompt_ids, skip_special_tokens=False)
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
-        completions_text_with_special_tokens = self.processing_class.batch_decode(
-            completion_ids, skip_special_tokens=False
-        )
 
         # Merge extra_fields from rollout_func into inputs for reward functions
         if extra_fields:
@@ -1976,9 +1955,7 @@ class GRPOTrainer(_BaseTrainer):
 
         # Log prompt and completion texts
         self._logs["prompt"].extend(gather_object(prompts_text))
-        self._logs["prompt_with_special_tokens"].extend(gather_object(prompts_text_with_special_tokens))
         self._logs["completion"].extend(gather_object(completions_text))
-        self._logs["completion_with_special_tokens"].extend(gather_object(completions_text_with_special_tokens))
         for i, name in enumerate(self.reward_func_names):
             self._logs["rewards"][name].extend(rewards_per_func[:, i].tolist())
         self._logs["advantages"].extend(all_process_advantages.tolist())

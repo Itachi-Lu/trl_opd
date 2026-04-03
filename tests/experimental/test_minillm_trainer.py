@@ -55,3 +55,41 @@ class TestMiniLLMTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.allclose(param, new_param), f"Parameter {n} has not changed"
+
+    def test_loss_mask_uses_completion_and_tool_masks(self):
+        trainer = object.__new__(MiniLLMTrainer)
+        inputs = {
+            "completion_mask": torch.tensor([[1, 1, 0], [1, 0, 0]], dtype=torch.long),
+            "tool_mask": torch.tensor([[1, 0, 1], [1, 1, 0]], dtype=torch.long),
+        }
+
+        mask = trainer._get_loss_mask(inputs)
+
+        expected = torch.tensor([[True, False, False], [True, False, False]])
+        assert torch.equal(mask, expected)
+
+    def test_dual_gate_respects_padding_and_preserves_scale(self):
+        trainer = object.__new__(MiniLLMTrainer)
+        trainer.gate_teacher_entropy_lambda = 2.0
+        trainer.gate_student_topk = 2
+        trainer.gate_weight_min = 0.2
+        trainer.gate_weight_max = 2.0
+
+        student_logits = torch.tensor(
+            [[[4.0, 3.0, 0.0, -1.0], [0.0, 3.0, 2.5, -1.0], [1.0, 0.0, -1.0, -2.0]]],
+            dtype=torch.float32,
+        )
+        teacher_probs = torch.tensor(
+            [[[0.82, 0.10, 0.05, 0.03], [0.50, 0.30, 0.15, 0.05], [0.25, 0.25, 0.25, 0.25]]],
+            dtype=torch.float32,
+        )
+        teacher_log_probs = teacher_probs.log()
+        mask = torch.tensor([[True, True, False]])
+
+        gate = trainer._compute_dual_gate(student_logits, teacher_log_probs, mask)
+
+        assert gate.shape == mask.shape
+        assert gate[0, 2].item() == 0.0
+        assert gate[0, 0].item() > gate[0, 1].item()
+        assert torch.isclose(gate[mask].mean(), torch.tensor(1.0), atol=1e-4)
+
