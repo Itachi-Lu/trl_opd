@@ -148,6 +148,7 @@ wandb/
 fan/opd/outputs/
 fan/SFT/output/
 fan/SFT/output_qwen3_1_7base_capybara/
+fan/SFT/output_qwen3_0_6_base_capybara/
 fan/SFT/output_token_stats_capybara/
 fan/SFT/trash/
 fan/SFT/eval_out/details/

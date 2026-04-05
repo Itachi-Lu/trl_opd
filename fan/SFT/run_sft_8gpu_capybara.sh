@@ -20,7 +20,7 @@ MASTER_PORT="${MASTER_PORT:-29532}"
 CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}"
 
 # Model Configuration
-MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-1.7B-Base}"
+MODEL_NAME="${MODEL_NAME:-Qwen/Qwen3-0.6B-Base}"
 ATTN_IMPL="${ATTN_IMPL:-sdpa}"
 
 # Dataset Configuration
@@ -29,7 +29,7 @@ MAX_LENGTH="${MAX_LENGTH:-16384}"
 DATASET_NUM_PROC="${DATASET_NUM_PROC:-32}"
 
 # Training Configuration (full-parameter SFT for instruction following)
-OUTPUT_DIR="${OUTPUT_DIR:-./output_qwen3_1_7base_capybara}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output_qwen3_0_6_base_capybara}"
 MAX_STEPS="${MAX_STEPS:--1}"
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
 LEARNING_RATE="${LEARNING_RATE:-2e-5}"
@@ -43,7 +43,8 @@ LOGGING_STEPS="${LOGGING_STEPS:-10}"
 SAVE_STEPS="${SAVE_STEPS:-50}"
 SAVE_TOTAL_LIMIT="${SAVE_TOTAL_LIMIT:-20}"
 REPORT_TO="${REPORT_TO:-wandb}"
-WANDB_PROJECT="${WANDB_PROJECT:-qwen3_1.7base_capybara}"
+WANDB_PROJECT="${WANDB_PROJECT:-qwen3_0.6base_capybara}"
+WANDB_NAME="${WANDB_NAME:-2026_4_4_13:42}"
 SEED="${SEED:-42}"
 
 # Debug

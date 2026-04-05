@@ -531,16 +531,35 @@ class MiniLLMTrainer(GRPOTrainer):
                 mode = "train" if self.model.training else "eval"
                 mask_float = mask.float()
                 valid_count = mask_float.sum().clamp(min=1.0)
+                valid_mask = mask.bool()
+                raw_valid = gate_stats["dual_gate_raw"][valid_mask].float()
+                final_valid = gate_stats["dual_gate_final"][valid_mask].float()
 
                 def masked_mean(x: torch.Tensor) -> torch.Tensor:
                     return (x * mask_float).sum() / valid_count
+
+                def safe_std(x: torch.Tensor) -> torch.Tensor:
+                    if x.numel() == 0:
+                        return torch.zeros((), device=mask.device)
+                    return x.std(unbiased=False)
+
+                def safe_quantile(x: torch.Tensor, q: float) -> torch.Tensor:
+                    if x.numel() == 0:
+                        return torch.zeros((), device=mask.device)
+                    return torch.quantile(x, q)
 
                 metric_tensors = {
                     "teacher_entropy/mean": masked_mean(gate_stats["teacher_entropy"]),
                     "teacher_gate/mean": masked_mean(gate_stats["teacher_gate"]),
                     "student_gate/mean": masked_mean(gate_stats["student_gate"]),
                     "dual_gate/raw_mean": masked_mean(gate_stats["dual_gate_raw"]),
+                    "dual_gate/raw_std": safe_std(raw_valid),
+                    "dual_gate/raw_p10": safe_quantile(raw_valid, 0.1),
+                    "dual_gate/raw_p90": safe_quantile(raw_valid, 0.9),
                     "dual_gate/mean": masked_mean(gate_stats["dual_gate_final"]),
+                    "dual_gate/final_std": safe_std(final_valid),
+                    "dual_gate/final_p10": safe_quantile(final_valid, 0.1),
+                    "dual_gate/final_p90": safe_quantile(final_valid, 0.9),
                     "dual_gate/clipped_low_ratio": masked_mean(gate_stats["dual_gate_low_clipped"]),
                     "dual_gate/clipped_high_ratio": masked_mean(gate_stats["dual_gate_high_clipped"]),
                 }
@@ -577,4 +596,3 @@ class MiniLLMTrainer(GRPOTrainer):
         checkpoint_dir = Path(self.args.output_dir) / f"checkpoint-{self.state.global_step}"
         if checkpoint_dir.exists():
             self._write_sample_rollout_file(checkpoint_dir)
-
