@@ -47,14 +47,22 @@ class MiniLLMConfig(GRPOConfig):
             Whether to apply length normalization to the rewards.
         use_dual_gate (`bool`, *optional*, defaults to `False`):
             Whether to apply dual teacher/student token gating to the distillation advantage.
+        use_gate_bonus (`bool`, *optional*, defaults to `True`):
+            Whether to apply the disagreement-based bonus on top of the base gate.
         gate_teacher_entropy_lambda (`float`, *optional*, defaults to `2.0`):
             Entropy penalty strength for the teacher reliability gate.
         gate_student_topk (`int`, *optional*, defaults to `32`):
             Top-k size used to estimate whether the teacher's probability mass lies in the student's learnable region.
+        gate_rank_tau (`float`, *optional*, defaults to `2.0`):
+            Exponential decay temperature for rank-weighted coverage inside the student's top-k support.
         gate_weight_min (`float`, *optional*, defaults to `0.2`):
-            Lower clip bound applied after gate re-normalization.
+            Lower clip bound applied to the normalized base gate.
         gate_weight_max (`float`, *optional*, defaults to `2.0`):
-            Upper clip bound applied after gate re-normalization.
+            Upper clip bound applied to the normalized base gate.
+        gate_bonus_min (`float`, *optional*, defaults to `1.0`):
+            Lower clip bound applied to the normalized disagreement bonus.
+        gate_bonus_max (`float`, *optional*, defaults to `2.0`):
+            Upper clip bound applied to the normalized disagreement bonus.
     """
 
     _VALID_DICT_FIELDS = GRPOConfig._VALID_DICT_FIELDS + ["teacher_model_init_kwargs"]
@@ -98,6 +106,10 @@ class MiniLLMConfig(GRPOConfig):
         default=False,
         metadata={"help": "Whether to apply dual teacher/student token gating to the distillation advantage."},
     )
+    use_gate_bonus: bool = field(
+        default=True,
+        metadata={"help": "Whether to apply the disagreement-based bonus on top of the base gate."},
+    )
     gate_teacher_entropy_lambda: float = field(
         default=2.0,
         metadata={"help": "Entropy penalty strength for the teacher reliability gate."},
@@ -106,13 +118,25 @@ class MiniLLMConfig(GRPOConfig):
         default=32,
         metadata={"help": "Top-k size used to estimate whether the teacher's mass lies in the student's learnable region."},
     )
+    gate_rank_tau: float = field(
+        default=2.0,
+        metadata={"help": "Exponential decay temperature for rank-weighted coverage inside the student's top-k support."},
+    )
     gate_weight_min: float = field(
         default=0.2,
-        metadata={"help": "Lower clip bound applied after gate re-normalization."},
+        metadata={"help": "Lower clip bound applied to the normalized base gate."},
     )
     gate_weight_max: float = field(
         default=2.0,
-        metadata={"help": "Upper clip bound applied after gate re-normalization."},
+        metadata={"help": "Upper clip bound applied to the normalized base gate."},
+    )
+    gate_bonus_min: float = field(
+        default=1.0,
+        metadata={"help": "Lower clip bound applied to the normalized disagreement bonus."},
+    )
+    gate_bonus_max: float = field(
+        default=2.0,
+        metadata={"help": "Upper clip bound applied to the normalized disagreement bonus."},
     )
 
     def __post_init__(self):
@@ -169,4 +193,3 @@ class MiniLLMConfig(GRPOConfig):
 
         if self.delta is not None and self.use_liger_kernel:
             raise ValueError("Liger kernel does not support two-sided GRPO loss yet.")
-

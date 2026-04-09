@@ -244,10 +244,14 @@ class MiniLLMTrainer(GRPOTrainer):
         self.gamma = args.gamma
         self.length_normalization = args.length_normalization
         self.use_dual_gate = args.use_dual_gate
+        self.use_gate_bonus = args.use_gate_bonus
         self.gate_teacher_entropy_lambda = args.gate_teacher_entropy_lambda
         self.gate_student_topk = args.gate_student_topk
+        self.gate_rank_tau = args.gate_rank_tau
         self.gate_weight_min = args.gate_weight_min
         self.gate_weight_max = args.gate_weight_max
+        self.gate_bonus_min = args.gate_bonus_min
+        self.gate_bonus_max = args.gate_bonus_max
 
     def _single_step_decomposition_loss(
         self,
@@ -368,6 +372,7 @@ class MiniLLMTrainer(GRPOTrainer):
         return_stats: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, dict[str, torch.Tensor]]:
         teacher_probs = teacher_log_probs.exp()
+        student_probs = F.softmax(student_logits, dim=-1)
         vocab_size = teacher_probs.size(-1)
         entropy_scale = math.log(vocab_size) if vocab_size > 1 else 1.0
         teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1) / entropy_scale
@@ -375,17 +380,42 @@ class MiniLLMTrainer(GRPOTrainer):
 
         topk = max(1, min(self.gate_student_topk, student_logits.size(-1)))
         topk_indices = student_logits.topk(topk, dim=-1).indices
-        teacher_topk_mass = teacher_probs.gather(dim=-1, index=topk_indices).sum(dim=-1)
+        teacher_slice = teacher_probs.gather(dim=-1, index=topk_indices)
+        student_slice = student_probs.gather(dim=-1, index=topk_indices)
 
-        raw_gate = teacher_gate * teacher_topk_mass
+        rank_positions = torch.arange(topk, device=student_logits.device, dtype=student_logits.dtype)
+        rank_tau = max(self.gate_rank_tau, 1e-6)
+        rank_weights = torch.exp(-rank_positions / rank_tau)
+        rank_weights = rank_weights / rank_weights.sum().clamp(min=1e-6)
+        student_gate = (teacher_slice * rank_weights.view(1, 1, -1)).sum(dim=-1)
+
+        teacher_local = teacher_slice / teacher_slice.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        student_local = student_slice / student_slice.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+        disagreement = 0.5 * torch.abs(teacher_local - student_local).sum(dim=-1)
+
         mask_float = mask.float()
         valid_count = mask_float.sum().clamp(min=1.0)
-        mean_gate = (raw_gate * mask_float).sum() / valid_count
-        normalized_gate = raw_gate / (mean_gate + 1e-6)
-        low_clipped = normalized_gate < self.gate_weight_min
-        high_clipped = normalized_gate > self.gate_weight_max
-        clipped_gate = normalized_gate.clamp(min=self.gate_weight_min, max=self.gate_weight_max)
-        final_gate = clipped_gate * mask_float
+
+        base_gate_raw = teacher_gate * student_gate
+        mean_base_gate = (base_gate_raw * mask_float).sum() / valid_count
+        base_gate_norm = base_gate_raw / (mean_base_gate + 1e-6)
+        base_gate_low_clipped = base_gate_norm < self.gate_weight_min
+        base_gate_high_clipped = base_gate_norm > self.gate_weight_max
+        base_gate = base_gate_norm.clamp(min=self.gate_weight_min, max=self.gate_weight_max)
+
+        if self.use_gate_bonus:
+            mean_disagreement = (disagreement * mask_float).sum() / valid_count
+            bonus_raw = disagreement / (mean_disagreement + 1e-6)
+            bonus_low_clipped = bonus_raw < self.gate_bonus_min
+            bonus_high_clipped = bonus_raw > self.gate_bonus_max
+            bonus = bonus_raw.clamp(min=self.gate_bonus_min, max=self.gate_bonus_max)
+        else:
+            bonus_raw = torch.ones_like(disagreement)
+            bonus_low_clipped = torch.zeros_like(disagreement, dtype=torch.bool)
+            bonus_high_clipped = torch.zeros_like(disagreement, dtype=torch.bool)
+            bonus = torch.ones_like(disagreement)
+
+        final_gate = base_gate * bonus * mask_float
 
         if not return_stats:
             return final_gate
@@ -393,11 +423,16 @@ class MiniLLMTrainer(GRPOTrainer):
         stats = {
             "teacher_entropy": teacher_entropy,
             "teacher_gate": teacher_gate,
-            "student_gate": teacher_topk_mass,
-            "dual_gate_raw": raw_gate,
-            "dual_gate_final": clipped_gate,
-            "dual_gate_low_clipped": low_clipped.float(),
-            "dual_gate_high_clipped": high_clipped.float(),
+            "student_gate": student_gate,
+            "disagreement": disagreement,
+            "bonus": bonus,
+            "bonus_low_clipped": bonus_low_clipped.float(),
+            "bonus_high_clipped": bonus_high_clipped.float(),
+            "base_gate": base_gate,
+            "base_gate_low_clipped": base_gate_low_clipped.float(),
+            "base_gate_high_clipped": base_gate_high_clipped.float(),
+            "dual_gate_raw": base_gate_raw,
+            "dual_gate_final": final_gate,
         }
         return final_gate, stats
 
@@ -533,6 +568,9 @@ class MiniLLMTrainer(GRPOTrainer):
                 valid_count = mask_float.sum().clamp(min=1.0)
                 valid_mask = mask.bool()
                 raw_valid = gate_stats["dual_gate_raw"][valid_mask].float()
+                base_valid = gate_stats["base_gate"][valid_mask].float()
+                disagreement_valid = gate_stats["disagreement"][valid_mask].float()
+                bonus_valid = gate_stats["bonus"][valid_mask].float()
                 final_valid = gate_stats["dual_gate_final"][valid_mask].float()
 
                 def masked_mean(x: torch.Tensor) -> torch.Tensor:
@@ -552,6 +590,25 @@ class MiniLLMTrainer(GRPOTrainer):
                     "teacher_entropy/mean": masked_mean(gate_stats["teacher_entropy"]),
                     "teacher_gate/mean": masked_mean(gate_stats["teacher_gate"]),
                     "student_gate/mean": masked_mean(gate_stats["student_gate"]),
+                    "student_gate/std": safe_std(gate_stats["student_gate"][valid_mask].float()),
+                    "student_gate/p10": safe_quantile(gate_stats["student_gate"][valid_mask].float(), 0.1),
+                    "student_gate/p90": safe_quantile(gate_stats["student_gate"][valid_mask].float(), 0.9),
+                    "disagreement/mean": masked_mean(gate_stats["disagreement"]),
+                    "disagreement/std": safe_std(disagreement_valid),
+                    "disagreement/p10": safe_quantile(disagreement_valid, 0.1),
+                    "disagreement/p90": safe_quantile(disagreement_valid, 0.9),
+                    "bonus/mean": masked_mean(gate_stats["bonus"]),
+                    "bonus/std": safe_std(bonus_valid),
+                    "bonus/p10": safe_quantile(bonus_valid, 0.1),
+                    "bonus/p90": safe_quantile(bonus_valid, 0.9),
+                    "bonus/clipped_low_ratio": masked_mean(gate_stats["bonus_low_clipped"]),
+                    "bonus/clipped_high_ratio": masked_mean(gate_stats["bonus_high_clipped"]),
+                    "base_gate/mean": masked_mean(gate_stats["base_gate"]),
+                    "base_gate/std": safe_std(base_valid),
+                    "base_gate/p10": safe_quantile(base_valid, 0.1),
+                    "base_gate/p90": safe_quantile(base_valid, 0.9),
+                    "base_gate/clipped_low_ratio": masked_mean(gate_stats["base_gate_low_clipped"]),
+                    "base_gate/clipped_high_ratio": masked_mean(gate_stats["base_gate_high_clipped"]),
                     "dual_gate/raw_mean": masked_mean(gate_stats["dual_gate_raw"]),
                     "dual_gate/raw_std": safe_std(raw_valid),
                     "dual_gate/raw_p10": safe_quantile(raw_valid, 0.1),
@@ -560,8 +617,6 @@ class MiniLLMTrainer(GRPOTrainer):
                     "dual_gate/final_std": safe_std(final_valid),
                     "dual_gate/final_p10": safe_quantile(final_valid, 0.1),
                     "dual_gate/final_p90": safe_quantile(final_valid, 0.9),
-                    "dual_gate/clipped_low_ratio": masked_mean(gate_stats["dual_gate_low_clipped"]),
-                    "dual_gate/clipped_high_ratio": masked_mean(gate_stats["dual_gate_high_clipped"]),
                 }
                 for name, value in metric_tensors.items():
                     self._metrics[mode][name].append(self.accelerator.gather(value).nanmean().item())
