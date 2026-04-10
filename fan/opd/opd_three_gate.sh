@@ -2,10 +2,10 @@
 
 set -euo pipefail
 
-export WANDB_PROJECT="${WANDB_PROJECT:-opd_1.7b_base_capybara_sft247_dual_gate}"
-export WANDB_NAME="${WANDB_NAME:-2026_4_3_11:47}"
+export WANDB_PROJECT="${WANDB_PROJECT:-opd_1.7b_base_capybara_sft247_three_gate}"
+export WANDB_NAME="${WANDB_NAME:-2026_4_9_three_gate}"
 
-# Paper-style OPD baseline with dual gating enabled:
+# Paper-style OPD baseline with base-gate + disagreement bonus enabled:
 # - training batch size B = 128
 # - mini-batch size B_mini = 32
 # - samples per prompt = 1
@@ -18,19 +18,17 @@ export WANDB_NAME="${WANDB_NAME:-2026_4_3_11:47}"
 # - steps_per_generation = 128 / 32 = 4
 # - gradient_accumulation_steps = 1 => 4 optimizer updates per rollout batch
 
-# /apdcephfs_zwfy2/share_302970870/shaofanliu
-
 accelerate launch \
   --config_file /apdcephfs_qy4/share_302593112/shaofanliu/projects/lzh/trl/examples/accelerate_configs/deepspeed_zero3.yaml \
   opd.py \
   --model_name_or_path /apdcephfs_qy4_302593112/share_302593112/shaofanliu/projects/lzh/trl/fan/SFT/output_qwen3_1_7base_capybara/checkpoint-247 \
-  --tokenizer_name_or_path /apdcephfs_zwfy2/share_302970870/shaofanliu/models/Qwen/Qwen3-1.7B \
-  --teacher_model_name_or_path /apdcephfs_zwfy2/share_302970870/shaofanliu/models/Qwen/Qwen3-8B \
+  --tokenizer_name_or_path Qwen/Qwen3-1.7B \
+  --teacher_model_name_or_path Qwen/Qwen3-8B \
   --dataset_name qwedsacf/competition_math \
   --dataset_train_split train \
   --dataset_eval_split none \
   --enable_thinking false \
-  --output_dir outputs/opd-qwen3_1_7base_capybarasft-from-8b-paper-dual-gate-2-stop \
+  --output_dir outputs/opd-qwen3_1_7base_capybarasft-from-8b-paper-three-gate \
   --learning_rate 3e-6 \
   --lr_scheduler_type cosine \
   --num_train_epochs 3 \
@@ -52,7 +50,11 @@ accelerate launch \
   --gradient_checkpointing \
   --dtype bfloat16 \
   --use_dual_gate true \
-  --gate_teacher_entropy_lambda 2.0 \
-  --gate_student_topk 32 \
+  --use_gate_bonus true \
+  --gate_teacher_entropy_lambda 3.0 \
+  --gate_student_topk 16 \
+  --gate_rank_tau 2.0 \
   --gate_weight_min 0.2 \
-  --gate_weight_max 2.0
+  --gate_weight_max 2.0 \
+  --gate_bonus_min 1.0 \
+  --gate_bonus_max 2.0

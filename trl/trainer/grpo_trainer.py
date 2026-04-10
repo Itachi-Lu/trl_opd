@@ -1078,6 +1078,73 @@ class GRPOTrainer(_BaseTrainer):
         entropies = torch.cat(all_entropies, dim=0) if compute_entropy else None
         return logps, entropies
 
+    @profiling_decorator
+    def _get_per_token_topk_logps(
+        self,
+        model,
+        input_ids,
+        attention_mask,
+        logits_to_keep,
+        topk,
+        temperature=None,
+        batch_size=None,
+        pixel_values=None,
+        image_grid_thw=None,
+        num_images=None,
+        pixel_attention_mask=None,
+        image_sizes=None,
+        token_type_ids=None,
+        mm_token_type_ids=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute the per-token top-k token ids and log-probs for each completion position."""
+        batch_size = batch_size or input_ids.size(0)
+        temperature = self.temperature if temperature is None else temperature
+        all_topk_ids = []
+        all_topk_logps = []
+        for start in range(0, input_ids.size(0), batch_size):
+            input_ids_batch = input_ids[start : start + batch_size]
+            attention_mask_batch = attention_mask[start : start + batch_size]
+
+            model_inputs = {"input_ids": input_ids_batch, "attention_mask": attention_mask_batch}
+            if image_grid_thw is not None and pixel_values is not None:
+                rows_per_image = image_grid_thw.prod(dim=-1)
+                rows_per_sample = torch.split(rows_per_image, num_images)
+                rows_per_sample = torch.stack([s.sum() for s in rows_per_sample])
+                cum_rows = torch.cat([torch.tensor([0], device=rows_per_sample.device), rows_per_sample.cumsum(0)])
+                row_start, row_end = cum_rows[start].item(), cum_rows[start + batch_size].item()
+                model_inputs["pixel_values"] = pixel_values[row_start:row_end]
+                cum_imgs = torch.tensor([0] + num_images).cumsum(0)
+                img_start, img_end = cum_imgs[start], cum_imgs[start + batch_size]
+                model_inputs["image_grid_thw"] = image_grid_thw[img_start:img_end]
+            elif pixel_values is not None:
+                model_inputs["pixel_values"] = pixel_values[start : start + batch_size]
+            if pixel_attention_mask is not None:
+                model_inputs["pixel_attention_mask"] = pixel_attention_mask[start : start + batch_size]
+            if image_sizes is not None:
+                model_inputs["image_sizes"] = image_sizes[start : start + batch_size]
+            if token_type_ids is not None:
+                model_inputs["token_type_ids"] = token_type_ids[start : start + batch_size]
+            if mm_token_type_ids is not None:
+                model_inputs["mm_token_type_ids"] = mm_token_type_ids[start : start + batch_size]
+
+            if "logits_to_keep" in self.model_kwarg_keys:
+                model_inputs["logits_to_keep"] = logits_to_keep + 1
+
+            model_inputs["use_cache"] = False
+
+            logits = model(**model_inputs).logits
+            logits = logits[:, :-1, :]
+            logits = logits[:, -logits_to_keep:, :]
+            logits.div_(temperature)
+
+            log_probs = torch.log_softmax(logits, dim=-1)
+            current_topk = min(topk, log_probs.size(-1))
+            topk_logps, topk_ids = torch.topk(log_probs, current_topk, dim=-1)
+            all_topk_ids.append(topk_ids)
+            all_topk_logps.append(topk_logps)
+
+        return torch.cat(all_topk_ids, dim=0), torch.cat(all_topk_logps, dim=0)
+
     def training_step(self, model, inputs, num_items_in_batch):
         time_before = time.perf_counter()
         output = super().training_step(model, inputs, num_items_in_batch)
@@ -1810,6 +1877,7 @@ class GRPOTrainer(_BaseTrainer):
             # old_per_token_logps to None.
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
+            cache_old_student_topk = getattr(self, "reverse_kl_estimator", None) == "old_student_topk_mean"
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
             if self.args.gradient_accumulation_steps % generate_every != 0 or (
                 self.use_vllm and self.vllm_importance_sampling_correction
@@ -1825,6 +1893,22 @@ class GRPOTrainer(_BaseTrainer):
                 )
             else:
                 old_per_token_logps = None
+
+            if cache_old_student_topk:
+                old_topk_token_ids, old_topk_logprobs = self._get_per_token_topk_logps(
+                    self.model,
+                    prompt_completion_ids,
+                    attention_mask,
+                    logits_to_keep,
+                    topk=self.reverse_kl_topk,
+                    temperature=getattr(self, "kd_temperature", self.temperature),
+                    batch_size=batch_size,
+                    num_images=num_images,
+                    **forward_kwargs,  # may contain pixel_values, image_grid_thw, pixel_attention_mask and image_sizes
+                )
+            else:
+                old_topk_token_ids = None
+                old_topk_logprobs = None
 
             # Compute the importance sampling ratio when using vLLM, to correct for potential distribution mismatch
             if self.use_vllm and self.vllm_importance_sampling_correction:
@@ -2032,6 +2116,10 @@ class GRPOTrainer(_BaseTrainer):
         }
         if old_per_token_logps is not None:
             output["old_per_token_logps"] = old_per_token_logps
+        if old_topk_token_ids is not None:
+            output["old_topk_token_ids"] = old_topk_token_ids
+        if old_topk_logprobs is not None:
+            output["old_topk_logprobs"] = old_topk_logprobs
         if self.use_vllm and self.vllm_importance_sampling_correction:
             output["importance_sampling_ratio"] = vllm_importance_sampling_ratio
         if sampling_per_token_logps is not None:

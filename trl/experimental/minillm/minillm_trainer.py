@@ -243,6 +243,8 @@ class MiniLLMTrainer(GRPOTrainer):
         self.rkl_advantage = args.rkl_advantage
         self.gamma = args.gamma
         self.length_normalization = args.length_normalization
+        self.reverse_kl_estimator = args.reverse_kl_estimator
+        self.reverse_kl_topk = args.reverse_kl_topk
         self.use_dual_gate = args.use_dual_gate
         self.use_gate_bonus = args.use_gate_bonus
         self.gate_teacher_entropy_lambda = args.gate_teacher_entropy_lambda
@@ -356,6 +358,20 @@ class MiniLLMTrainer(GRPOTrainer):
             advantages = rewards
 
         return advantages
+
+    def _get_old_student_topk_mean_log_probs(
+        self, inputs: dict[str, torch.Tensor], teacher_log_probs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        old_topk_token_ids = inputs.get("old_topk_token_ids")
+        old_topk_logprobs = inputs.get("old_topk_logprobs")
+        if old_topk_token_ids is None or old_topk_logprobs is None:
+            raise RuntimeError(
+                "MiniLLM reverse_kl_estimator='old_student_topk_mean' requires `old_topk_token_ids` and "
+                "`old_topk_logprobs`, but they were not found in the inputs."
+            )
+
+        teacher_topk_log_probs = teacher_log_probs.gather(dim=-1, index=old_topk_token_ids)
+        return old_topk_logprobs.mean(dim=-1), teacher_topk_log_probs.mean(dim=-1)
 
     @staticmethod
     def _get_loss_mask(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -551,9 +567,24 @@ class MiniLLMTrainer(GRPOTrainer):
         mask = self._get_loss_mask(inputs)
 
         if self.rkl_advantage:
+            if self.reverse_kl_estimator == "label":
+                rollout_log_probs_on_labels = inputs.get("old_per_token_logps")
+                if rollout_log_probs_on_labels is None:
+                    raise RuntimeError(
+                        "MiniLLM reverse_kl_estimator='label' requires `old_per_token_logps`, but it was not found "
+                        "in the inputs."
+                    )
+                reverse_kl_teacher_log_probs = teacher_log_probs_on_labels
+            elif self.reverse_kl_estimator == "old_student_topk_mean":
+                rollout_log_probs_on_labels, reverse_kl_teacher_log_probs = self._get_old_student_topk_mean_log_probs(
+                    inputs, teacher_log_probs
+                )
+            else:
+                raise ValueError(f"Unknown reverse_kl_estimator: {self.reverse_kl_estimator}")
+
             reverse_kl_advantage = self._compute_advantage(
-                student_log_probs_on_labels=student_log_probs_on_labels,
-                teacher_log_probs_on_labels=teacher_log_probs_on_labels,
+                student_log_probs_on_labels=rollout_log_probs_on_labels,
+                teacher_log_probs_on_labels=reverse_kl_teacher_log_probs,
                 mask=mask,
             )
 
@@ -621,6 +652,7 @@ class MiniLLMTrainer(GRPOTrainer):
                 for name, value in metric_tensors.items():
                     self._metrics[mode][name].append(self.accelerator.gather(value).nanmean().item())
 
+            reverse_kl_advantage = reverse_kl_advantage.detach()
             inputs["advantages"] = inputs["advantages"].unsqueeze(1) + reverse_kl_advantage
 
         # Compute GRPO loss on verifiable reward

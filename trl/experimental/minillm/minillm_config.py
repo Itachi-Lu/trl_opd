@@ -45,6 +45,12 @@ class MiniLLMConfig(GRPOConfig):
             Discount factor for future rewards in reinforcement learning.
         length_normalization (`bool`, *optional*, defaults to `True`):
             Whether to apply length normalization to the rewards.
+        reverse_kl_estimator (`str`, *optional*, defaults to `"label"`):
+            Reverse KL reward estimator to use. `"label"` uses the sampled token only, while
+            `"old_student_topk_mean"` averages the teacher/student log-prob differences over the old student's top-k
+            tokens at each position.
+        reverse_kl_topk (`int`, *optional*, defaults to `8`):
+            Top-k size used by the `"old_student_topk_mean"` reverse KL estimator.
         use_dual_gate (`bool`, *optional*, defaults to `False`):
             Whether to apply dual teacher/student token gating to the distillation advantage.
         use_gate_bonus (`bool`, *optional*, defaults to `True`):
@@ -101,6 +107,17 @@ class MiniLLMConfig(GRPOConfig):
         default=True,
         metadata={"help": "Whether to apply length normalization to the rewards."},
     )
+    reverse_kl_estimator: str = field(
+        default="label",
+        metadata={
+            "help": "Reverse KL reward estimator to use. Supported values are 'label' and "
+            "'old_student_topk_mean'."
+        },
+    )
+    reverse_kl_topk: int = field(
+        default=8,
+        metadata={"help": "Top-k size used by the 'old_student_topk_mean' reverse KL estimator."},
+    )
 
     use_dual_gate: bool = field(
         default=False,
@@ -149,6 +166,14 @@ class MiniLLMConfig(GRPOConfig):
         self.scale_rewards = {True: "group", False: "none"}.get(self.scale_rewards, self.scale_rewards)
         if self.num_generations == 1:
             self.scale_rewards = "none"
+
+        if self.reverse_kl_estimator not in {"label", "old_student_topk_mean"}:
+            raise ValueError(
+                "reverse_kl_estimator must be one of {'label', 'old_student_topk_mean'}, but got "
+                f"{self.reverse_kl_estimator!r}."
+            )
+        if self.reverse_kl_topk < 1:
+            raise ValueError(f"reverse_kl_topk must be >= 1, but got {self.reverse_kl_topk}.")
 
         num_processes = self.world_size
         # The current default effective batch size
