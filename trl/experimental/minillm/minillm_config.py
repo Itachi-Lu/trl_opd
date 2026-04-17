@@ -45,12 +45,18 @@ class MiniLLMConfig(GRPOConfig):
             Discount factor for future rewards in reinforcement learning.
         length_normalization (`bool`, *optional*, defaults to `True`):
             Whether to apply length normalization to the rewards.
-        reverse_kl_estimator (`str`, *optional*, defaults to `"label"`):
-            Reverse KL reward estimator to use. `"label"` uses the sampled token only, while
-            `"old_student_topk_mean"` averages the teacher/student log-prob differences over the old student's top-k
-            tokens at each position.
-        reverse_kl_topk (`int`, *optional*, defaults to `8`):
-            Top-k size used by the `"old_student_topk_mean"` reverse KL estimator.
+        distill_mode (`str`, *optional*, defaults to `"reverse_kl"`):
+            Distillation objective to use. `"reverse_kl"` keeps the existing reverse-KL advantage path.
+            `"student_topp_reverse_kl"` optimizes reverse KL on the student's top-p/min-k support.
+        support_top_p (`float`, *optional*, defaults to `0.95`):
+            Cumulative probability threshold for the student's support-distillation set.
+        support_min_k (`int`, *optional*, defaults to `32`):
+            Minimum number of tokens to keep in the student's support-distillation set.
+        support_loss_coef (`float`, *optional*, defaults to `1.0`):
+            Coefficient applied to the direct support-distillation loss.
+        support_loss_use_teacher_mass_weighting (`bool`, *optional*, defaults to `False`):
+            Whether to weight each token's support distillation KL by the teacher probability mass assigned to the
+            student's support tokens at that position.
         use_dual_gate (`bool`, *optional*, defaults to `False`):
             Whether to apply dual teacher/student token gating to the distillation advantage.
         use_gate_bonus (`bool`, *optional*, defaults to `True`):
@@ -107,16 +113,31 @@ class MiniLLMConfig(GRPOConfig):
         default=True,
         metadata={"help": "Whether to apply length normalization to the rewards."},
     )
-    reverse_kl_estimator: str = field(
-        default="label",
+    distill_mode: str = field(
+        default="reverse_kl",
         metadata={
-            "help": "Reverse KL reward estimator to use. Supported values are 'label' and "
-            "'old_student_topk_mean'."
+            "help": "Distillation objective to use. Supported values are 'reverse_kl' and "
+            "'student_topp_reverse_kl'."
         },
     )
-    reverse_kl_topk: int = field(
-        default=8,
-        metadata={"help": "Top-k size used by the 'old_student_topk_mean' reverse KL estimator."},
+    support_top_p: float = field(
+        default=0.95,
+        metadata={"help": "Cumulative probability threshold for the student's support-distillation set."},
+    )
+    support_min_k: int = field(
+        default=32,
+        metadata={"help": "Minimum number of tokens to keep in the student's support-distillation set."},
+    )
+    support_loss_coef: float = field(
+        default=1.0,
+        metadata={"help": "Coefficient applied to the direct support-distillation loss."},
+    )
+    support_loss_use_teacher_mass_weighting: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to weight each token's support distillation KL by the teacher mass on the student's "
+            "support."
+        },
     )
 
     use_dual_gate: bool = field(
@@ -167,13 +188,18 @@ class MiniLLMConfig(GRPOConfig):
         if self.num_generations == 1:
             self.scale_rewards = "none"
 
-        if self.reverse_kl_estimator not in {"label", "old_student_topk_mean"}:
+        valid_distill_modes = {"reverse_kl", "student_topp_reverse_kl"}
+        if self.distill_mode not in valid_distill_modes:
             raise ValueError(
-                "reverse_kl_estimator must be one of {'label', 'old_student_topk_mean'}, but got "
-                f"{self.reverse_kl_estimator!r}."
+                "distill_mode must be one of {'reverse_kl', 'student_topp_reverse_kl'}, but got "
+                f"{self.distill_mode!r}."
             )
-        if self.reverse_kl_topk < 1:
-            raise ValueError(f"reverse_kl_topk must be >= 1, but got {self.reverse_kl_topk}.")
+        if not (0.0 < self.support_top_p <= 1.0):
+            raise ValueError(f"support_top_p must be in (0, 1], but got {self.support_top_p}.")
+        if self.support_min_k < 1:
+            raise ValueError(f"support_min_k must be >= 1, but got {self.support_min_k}.")
+        if self.support_loss_coef < 0.0:
+            raise ValueError(f"support_loss_coef must be >= 0, but got {self.support_loss_coef}.")
 
         num_processes = self.world_size
         # The current default effective batch size

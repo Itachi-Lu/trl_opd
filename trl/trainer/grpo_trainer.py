@@ -1165,6 +1165,25 @@ class GRPOTrainer(_BaseTrainer):
     def _is_terminated_completion(self, token_ids: list[int]) -> bool:
         return bool(token_ids) and token_ids[-1] in self._terminal_token_id_set
 
+    def _mask_terminal_pad_tokens(
+        self, completion_ids: torch.Tensor, completion_mask: torch.Tensor
+    ) -> torch.Tensor:
+        if self.pad_token_id is None or completion_ids.size(1) == 0:
+            return completion_mask
+
+        valid_lengths = completion_mask.sum(dim=1)
+        has_tokens = valid_lengths > 0
+        if not has_tokens.any():
+            return completion_mask
+
+        last_token_positions = valid_lengths[has_tokens] - 1
+        row_indices = has_tokens.nonzero(as_tuple=True)[0]
+        final_tokens = completion_ids[row_indices, last_token_positions]
+        completion_mask[row_indices, last_token_positions] = completion_mask[row_indices, last_token_positions] * (
+            final_tokens != self.pad_token_id
+        ).to(completion_mask.dtype)
+        return completion_mask
+
     @profiling_decorator
     def _prepare_inputs(self, generation_batch: dict[str, torch.Tensor | Any]) -> dict[str, torch.Tensor | Any]:
         # Prepares inputs for model training/evaluation by managing completion generation and batch handling.
@@ -1785,6 +1804,7 @@ class GRPOTrainer(_BaseTrainer):
         completion_mask = pad(
             completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         ).to(device=device)
+        completion_mask = self._mask_terminal_pad_tokens(completion_ids, completion_mask)
         if sampling_per_token_logps_list is not None:
             sampling_per_token_logps = [torch.tensor(logps) for logps in sampling_per_token_logps_list]
             sampling_per_token_logps = pad(

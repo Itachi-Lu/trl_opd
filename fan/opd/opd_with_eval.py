@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
+import pandas as pd
 from datasets import Dataset, DatasetDict, load_dataset
 from transformers import AutoTokenizer
 
@@ -19,8 +20,93 @@ from trl.chat_template_utils import qwen3_training_chat_template
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
 
 
-def constant_reward(completions: list[str], **kwargs) -> list[float]:
-    return [1.0] * len(completions)
+EVAL_SUITE_DATA_DIR = Path(
+    "/apdcephfs_qy4/share_302593112/shaofanliu/projects/lzh"
+    "/eval_suite/EvalSuite/data"
+)
+
+EVAL_DATASETS = {
+    "aime24": "AIME24/test.parquet",
+    "aime25": "AIME25/test.parquet",
+    "amc23": "AMC23/test.parquet",
+    "math500": "MATH-500/test.parquet",
+    "olympiadbench": "Olympiad-Bench/test.parquet",
+    "minerva": "Minerva/test.parquet",
+}
+
+
+def _load_parquet_eval_dataset(
+    parquet_path: Path, enable_thinking: bool = False
+) -> Dataset:
+    df = pd.read_parquet(parquet_path)
+    records = []
+    for i in range(len(df)):
+        raw_prompt = df.at[i, "prompt"]
+        if isinstance(raw_prompt, list) and raw_prompt:
+            problem_text = raw_prompt[0].get("content", "").strip()
+        else:
+            problem_text = str(raw_prompt).strip()
+
+        reward_model = df.at[i, "reward_model"]
+        if isinstance(reward_model, dict):
+            solution = reward_model.get("ground_truth", "").strip()
+        else:
+            solution = str(reward_model).strip()
+
+        if enable_thinking:
+            prompt = [{"role": "user", "content": problem_text}]
+        else:
+            prompt = [
+                {"role": "system", "content": "/no_think"},
+                {"role": "user", "content": problem_text},
+            ]
+
+        records.append({"prompt": prompt, "solution": solution})
+
+    return Dataset.from_list(records)
+
+
+def load_eval_datasets(
+    data_dir: Path | None = None,
+    dataset_names: list[str] | None = None,
+    enable_thinking: bool = False,
+) -> dict[str, Dataset]:
+    if data_dir is None:
+        data_dir = EVAL_SUITE_DATA_DIR
+    if dataset_names is None:
+        dataset_names = list(EVAL_DATASETS.keys())
+
+    result = {}
+    for name in dataset_names:
+        rel_path = EVAL_DATASETS.get(name)
+        if rel_path is None:
+            raise ValueError(
+                f"Unknown eval dataset {name!r}. Available: {sorted(EVAL_DATASETS)}"
+            )
+        parquet_path = data_dir / rel_path
+        if not parquet_path.exists():
+            raise FileNotFoundError(f"Eval parquet not found: {parquet_path}")
+        result[name] = _load_parquet_eval_dataset(parquet_path, enable_thinking)
+        print(f"  Loaded eval dataset {name!r}: {len(result[name])} samples from {parquet_path}")
+
+    return result
+
+
+def accuracy_reward_with_fallback(
+    completions, solution=None, **kwargs
+) -> list[float]:
+    if solution is None:
+        return [1.0] * len(completions)
+    try:
+        from trl.rewards import accuracy_reward
+        rewards = accuracy_reward(completions, solution=solution, **kwargs)
+        return [r if r is not None else 0.0 for r in rewards]
+    except ImportError:
+        print(
+            "WARNING: math_verify not installed, falling back to constant reward. "
+            "Install with: pip install math_verify"
+        )
+        return [1.0] * len(completions)
 
 
 def _attach_token_debug_dump(trainer: MiniLLMTrainer, output_dir: str) -> None:
@@ -92,9 +178,7 @@ class OPDScriptArguments:
     )
     tokenizer_name_or_path: str | None = field(
         default=None,
-        metadata={
-            "help": "Optional tokenizer identifier or local path. If unset, fall back to model_name_or_path-based logic."
-        },
+        metadata={"help": "Optional tokenizer identifier or local path."},
     )
     groups_per_batch: int = field(
         default=512,
@@ -114,16 +198,19 @@ class OPDScriptArguments:
     )
     enable_thinking: bool = field(
         default=True,
-        metadata={
-            "help": "Whether prompts should allow thinking mode. If false, a `/no_think` system message is prepended."
-        },
+        metadata={"help": "Whether prompts should allow thinking mode."},
     )
     tinker_single_update: bool = field(
         default=True,
-        metadata={
-            "help": "If true, reshape TRL batching so one rollout batch is consumed in a single optimizer update, "
-            "which is closer to tinker-cookbook's default OPD dynamics."
-        },
+        metadata={"help": "If true, reshape TRL batching for single optimizer update per rollout batch."},
+    )
+    eval_data_dir: str | None = field(
+        default=None,
+        metadata={"help": "Path to the eval suite data directory containing parquet files."},
+    )
+    eval_datasets: str = field(
+        default="aime24,aime25,amc23,math500,olympiadbench,minerva",
+        metadata={"help": "Comma-separated list of eval dataset names."},
     )
 
 
@@ -155,16 +242,13 @@ def _ensure_prompt_only_dataset(
             {"role": "user", "content": content},
         ]
 
-    if "prompt" in column_names:
-        return dataset
-
     if "question" in column_names:
         source_key = "question"
     elif "problem" in column_names:
         source_key = "problem"
     else:
         raise ValueError(
-            "Dataset must contain a `prompt` column, or a `question`/`problem` column that can be converted into one. "
+            "Dataset must contain a `prompt` column, or a `question`/`problem` column. "
             f"Found columns: {sorted(column_names)}"
         )
 
@@ -208,8 +292,6 @@ def _resolve_dtype(dtype_name: str | None) -> torch.dtype | str | None:
 
 
 def _resolve_processing_class_name(model_name_or_path: str) -> str:
-    # Qwen3 base checkpoints share the same vocabulary with the chat model, but the chat tokenizer ships
-    # the turn-ending EOS configuration (<|im_end|>) that better matches our conversational template.
     if model_name_or_path.startswith("Qwen/Qwen3-") and model_name_or_path.endswith("-Base"):
         return model_name_or_path[: -len("-Base")]
     return model_name_or_path
@@ -287,7 +369,22 @@ if __name__ == "__main__":
     training_args.num_iterations = 1
     training_args.temperature = 1.0
 
-    train_dataset, eval_dataset = _load_dataset_splits(script_args)
+    # --- Load training data ---
+    train_dataset, _ = _load_dataset_splits(script_args)
+
+    # --- Load eval data from parquet ---
+    eval_data_dir = Path(script_args.eval_data_dir) if script_args.eval_data_dir else None
+    eval_dataset_names = [n.strip() for n in script_args.eval_datasets.split(",") if n.strip()]
+    print(f"Loading eval datasets: {eval_dataset_names}")
+    eval_datasets = load_eval_datasets(
+        data_dir=eval_data_dir,
+        dataset_names=eval_dataset_names,
+        enable_thinking=script_args.enable_thinking,
+    )
+    total_eval = sum(len(ds) for ds in eval_datasets.values())
+    print(f"Loaded {len(eval_datasets)} eval datasets, {total_eval} samples total")
+
+    # --- Tokenizer ---
     tokenizer_name_or_path = (
         script_args.tokenizer_name_or_path.strip() if script_args.tokenizer_name_or_path else None
     )
@@ -304,13 +401,14 @@ if __name__ == "__main__":
     if processing_class.pad_token is None:
         processing_class.pad_token = processing_class.eos_token
 
+    # --- Create trainer ---
     trainer = MiniLLMTrainer(
         model=model_args.model_name_or_path,
         teacher_model=script_args.teacher_model_name_or_path,
-        reward_funcs=constant_reward,
+        reward_funcs=accuracy_reward_with_fallback,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
+        eval_dataset=eval_datasets,
         processing_class=processing_class,
         peft_config=get_peft_config(model_args),
     )
@@ -318,6 +416,7 @@ if __name__ == "__main__":
         trainer.chat_template = qwen3_training_chat_template
     _attach_token_debug_dump(trainer, training_args.output_dir)
 
+    # --- Train ---
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model(training_args.output_dir)
     trainer.save_state()

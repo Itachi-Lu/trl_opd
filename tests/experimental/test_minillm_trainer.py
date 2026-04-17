@@ -14,6 +14,7 @@
 
 import pytest
 import torch
+import torch.nn as nn
 from datasets import load_dataset
 
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
@@ -23,6 +24,14 @@ from ..testing_utils import TrlTestCase
 
 @pytest.mark.low_priority
 class TestMiniLLMTrainer(TrlTestCase):
+    def test_config_distill_mode_defaults_to_reverse_kl(self):
+        config = MiniLLMConfig(output_dir=self.tmp_dir, report_to="none", num_generations=1)
+
+        assert config.distill_mode == "reverse_kl"
+        assert config.support_top_p == pytest.approx(0.95)
+        assert config.support_min_k == 32
+        assert config.support_loss_coef == pytest.approx(1.0)
+
     def test_train(self):
         # Get the dataset
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only", split="train")
@@ -93,3 +102,88 @@ class TestMiniLLMTrainer(TrlTestCase):
         assert gate[0, 0].item() > gate[0, 1].item()
         assert torch.isclose(gate[mask].mean(), torch.tensor(1.0), atol=1e-4)
 
+    def test_student_topp_support_respects_top_p_and_min_k(self):
+        trainer = object.__new__(MiniLLMTrainer)
+        student_probs = torch.tensor(
+            [[[0.70, 0.20, 0.07, 0.03], [0.50, 0.25, 0.15, 0.10]]],
+            dtype=torch.float32,
+        )
+        student_logits = student_probs.log()
+
+        topk_indices, support_sizes = trainer._build_student_topp_support(student_logits, top_p=0.85, min_k=3)
+
+        expected_sizes = torch.tensor([[3, 3]], dtype=torch.long)
+        assert torch.equal(support_sizes, expected_sizes)
+
+        assert topk_indices.shape[-1] >= 3
+        assert topk_indices[0, 0, 0].item() == 0
+        assert topk_indices[0, 0, 1].item() == 1
+
+    def test_support_reverse_kl_is_zero_when_teacher_matches_student(self):
+        trainer = object.__new__(MiniLLMTrainer)
+        trainer.distill_mode = "student_topp_reverse_kl"
+        trainer.support_top_p = 0.85
+        trainer.support_min_k = 2
+
+        student_logits = torch.log(
+            torch.tensor(
+                [[[0.55, 0.25, 0.15, 0.05], [0.45, 0.30, 0.20, 0.05]]],
+                dtype=torch.float32,
+            )
+        )
+        teacher_logits = student_logits.clone()
+        mask = torch.tensor([[True, True]])
+
+        loss = trainer._compute_support_distill_loss(student_logits, teacher_logits, mask)
+
+        assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
+    def test_support_distill_reverse_kl_mode_does_not_require_old_topk_cache(self):
+        class DummyCausalLM(nn.Module):
+            def __init__(self, logits: torch.Tensor):
+                super().__init__()
+                self.register_buffer("fixed_logits", logits)
+
+            def forward(self, input_ids=None, attention_mask=None, use_cache=False):
+                batch_size = input_ids.size(0)
+                logits = self.fixed_logits.expand(batch_size, -1, -1).clone()
+                return type("DummyOutput", (), {"logits": logits})()
+
+        trainer = object.__new__(MiniLLMTrainer)
+        trainer.teacher_model = DummyCausalLM(
+            torch.log(
+                torch.tensor(
+                    [[[0.40, 0.30, 0.20, 0.10], [0.45, 0.25, 0.20, 0.10], [0.50, 0.20, 0.20, 0.10]]],
+                    dtype=torch.float32,
+                )
+            )
+        )
+        trainer.kd_temperature = 1.0
+        trainer.distill_mode = "student_topp_reverse_kl"
+        trainer.rkl_advantage = True
+        trainer.single_step_decomposition = False
+        trainer.support_top_p = 0.85
+        trainer.support_min_k = 2
+        trainer.support_loss_coef = 1.0
+        trainer._compute_loss = lambda model, inputs: torch.zeros((), dtype=torch.float32)
+
+        model = DummyCausalLM(
+            torch.log(
+                torch.tensor(
+                    [[[0.45, 0.30, 0.15, 0.10], [0.50, 0.20, 0.20, 0.10], [0.35, 0.30, 0.20, 0.15]]],
+                    dtype=torch.float32,
+                )
+            )
+        )
+        inputs = {
+            "prompt_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "completion_ids": torch.tensor([[3]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1]], dtype=torch.long),
+            "advantages": torch.tensor([0.0], dtype=torch.float32),
+        }
+
+        loss = trainer.compute_loss(model, inputs)
+
+        assert torch.isfinite(loss)
+        assert loss.item() > 0.0

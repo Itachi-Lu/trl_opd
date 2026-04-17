@@ -243,8 +243,11 @@ class MiniLLMTrainer(GRPOTrainer):
         self.rkl_advantage = args.rkl_advantage
         self.gamma = args.gamma
         self.length_normalization = args.length_normalization
-        self.reverse_kl_estimator = args.reverse_kl_estimator
-        self.reverse_kl_topk = args.reverse_kl_topk
+        self.distill_mode = args.distill_mode
+        self.support_top_p = args.support_top_p
+        self.support_min_k = args.support_min_k
+        self.support_loss_coef = args.support_loss_coef
+        self.support_loss_use_teacher_mass_weighting = args.support_loss_use_teacher_mass_weighting
         self.use_dual_gate = args.use_dual_gate
         self.use_gate_bonus = args.use_gate_bonus
         self.gate_teacher_entropy_lambda = args.gate_teacher_entropy_lambda
@@ -359,26 +362,127 @@ class MiniLLMTrainer(GRPOTrainer):
 
         return advantages
 
-    def _get_old_student_topk_mean_log_probs(
-        self, inputs: dict[str, torch.Tensor], teacher_log_probs: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        old_topk_token_ids = inputs.get("old_topk_token_ids")
-        old_topk_logprobs = inputs.get("old_topk_logprobs")
-        if old_topk_token_ids is None or old_topk_logprobs is None:
-            raise RuntimeError(
-                "MiniLLM reverse_kl_estimator='old_student_topk_mean' requires `old_topk_token_ids` and "
-                "`old_topk_logprobs`, but they were not found in the inputs."
-            )
-
-        teacher_topk_log_probs = teacher_log_probs.gather(dim=-1, index=old_topk_token_ids)
-        return old_topk_logprobs.mean(dim=-1), teacher_topk_log_probs.mean(dim=-1)
-
     @staticmethod
     def _get_loss_mask(inputs: dict[str, torch.Tensor]) -> torch.Tensor:
         mask = inputs["completion_mask"].bool()
         if "tool_mask" in inputs:
             mask = mask & inputs["tool_mask"].bool()
         return mask
+
+    def _build_student_topp_support(
+        self, student_logits: torch.Tensor, top_p: float, min_k: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        vocab_size = student_logits.size(-1)
+        min_k = min(max(1, min_k), vocab_size)
+        candidate_k = min(max(min_k, 512), vocab_size)
+
+        student_probs = F.softmax(student_logits.detach(), dim=-1)
+        topk_probs, topk_indices = student_probs.topk(candidate_k, dim=-1, sorted=True)
+        cumulative_probs = topk_probs.cumsum(dim=-1)
+
+        support_sizes = (cumulative_probs < top_p).sum(dim=-1) + 1
+        support_sizes = support_sizes.clamp(min=min_k, max=candidate_k)
+
+        return topk_indices, support_sizes
+
+    @staticmethod
+    def _build_local_support_mask(
+        support_sizes: torch.Tensor, support_width: int, device: torch.device
+    ) -> torch.Tensor:
+        rank_positions = torch.arange(support_width, device=device).view(1, 1, support_width)
+        return rank_positions < support_sizes.unsqueeze(-1)
+
+    @staticmethod
+    def _compute_teacher_mass(
+        teacher_log_probs: torch.Tensor, support_indices: torch.Tensor, local_support_mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        teacher_support_probs = teacher_log_probs.gather(dim=-1, index=support_indices).exp()
+        if local_support_mask is not None:
+            teacher_support_probs = teacher_support_probs * local_support_mask.to(teacher_support_probs.dtype)
+        return teacher_support_probs.sum(dim=-1)
+
+    def _log_masked_distribution_metrics(
+        self, prefix: str, values: torch.Tensor, mask: torch.Tensor, mode: str
+    ) -> None:
+        values = values.detach().float()
+        gathered_values = self.accelerator.gather(values)
+        gathered_mask = self.accelerator.gather(mask.detach().to(dtype=torch.int32)).bool()
+        valid_values = gathered_values[gathered_mask]
+
+        if valid_values.numel() == 0:
+            zero = torch.zeros((), device=values.device)
+            metric_tensors = {"mean": zero, "p10": zero, "p90": zero}
+        else:
+            metric_tensors = {
+                "mean": valid_values.mean(),
+                "p10": torch.quantile(valid_values, 0.1),
+                "p90": torch.quantile(valid_values, 0.9),
+            }
+
+        for suffix, value in metric_tensors.items():
+            self._metrics[mode][f"{prefix}/{suffix}"].append(value.item())
+
+    def _log_teacher_mass_metrics(
+        self, student_logits: torch.Tensor, teacher_log_probs: torch.Tensor, mask: torch.Tensor, mode: str
+    ) -> None:
+        with torch.no_grad():
+            max_topk = min(32, student_logits.size(-1))
+            topk_indices = student_logits.detach().topk(max_topk, dim=-1).indices
+            for k in (8, 16, 32):
+                teacher_mass = self._compute_teacher_mass(teacher_log_probs, topk_indices[..., : min(k, max_topk)])
+                self._log_masked_distribution_metrics(f"teacher_mass/topk_{k}", teacher_mass, mask, mode)
+
+            for top_p, suffix in ((0.8, "80"), (0.9, "90")):
+                support_indices, support_sizes = self._build_student_topp_support(
+                    student_logits, top_p=top_p, min_k=1
+                )
+                local_support_mask = self._build_local_support_mask(
+                    support_sizes, support_indices.size(-1), student_logits.device
+                )
+                teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
+                self._log_masked_distribution_metrics(f"teacher_mass/topp_{suffix}", teacher_mass, mask, mode)
+
+            support_indices, support_sizes = self._build_student_topp_support(
+                student_logits, top_p=self.support_top_p, min_k=self.support_min_k
+            )
+            local_support_mask = self._build_local_support_mask(
+                support_sizes, support_indices.size(-1), student_logits.device
+            )
+            teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
+            self._log_masked_distribution_metrics("teacher_mass/support", teacher_mass, mask, mode)
+
+    def _compute_support_distill_loss(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        topk_indices, support_sizes = self._build_student_topp_support(
+            student_logits, top_p=self.support_top_p, min_k=self.support_min_k
+        )
+        max_support_size = int(support_sizes.max().item())
+        support_indices = topk_indices[..., :max_support_size]
+        local_support_mask = self._build_local_support_mask(support_sizes, max_support_size, student_logits.device)
+        neg_large = torch.finfo(student_logits.dtype).min
+
+        student_support_logits = student_logits.gather(dim=-1, index=support_indices)
+        teacher_support_logits = teacher_logits.gather(dim=-1, index=support_indices)
+        masked_student_support_logits = student_support_logits.masked_fill(~local_support_mask, neg_large)
+        masked_teacher_support_logits = teacher_support_logits.masked_fill(~local_support_mask, neg_large)
+
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
+
+        local_student_log_probs = F.log_softmax(masked_student_support_logits, dim=-1)
+        local_teacher_log_probs = F.log_softmax(masked_teacher_support_logits, dim=-1)
+        local_student_probs = local_student_log_probs.exp()
+
+        per_token_loss = (local_student_probs * (local_student_log_probs - local_teacher_log_probs)).sum(dim=-1)
+        if self.support_loss_use_teacher_mass_weighting:
+            per_token_loss = per_token_loss * teacher_mass
+
+        mask_float = mask.float()
+        return (per_token_loss * mask_float).sum() / mask_float.sum().clamp(min=1.0)
 
     def _compute_dual_gate(
         self,
@@ -565,22 +669,16 @@ class MiniLLMTrainer(GRPOTrainer):
         ).squeeze(-1)
 
         mask = self._get_loss_mask(inputs)
+        mode = "train" if self.model.training else "eval"
+        self._log_teacher_mass_metrics(student_logits, teacher_log_probs, mask, mode)
 
-        if self.rkl_advantage:
-            if self.reverse_kl_estimator == "label":
-                rollout_log_probs_on_labels = inputs.get("old_per_token_logps")
-                if rollout_log_probs_on_labels is None:
-                    raise RuntimeError(
-                        "MiniLLM reverse_kl_estimator='label' requires `old_per_token_logps`, but it was not found "
-                        "in the inputs."
-                    )
-                reverse_kl_teacher_log_probs = teacher_log_probs_on_labels
-            elif self.reverse_kl_estimator == "old_student_topk_mean":
-                rollout_log_probs_on_labels, reverse_kl_teacher_log_probs = self._get_old_student_topk_mean_log_probs(
-                    inputs, teacher_log_probs
+        if self.distill_mode == "reverse_kl" and self.rkl_advantage:
+            rollout_log_probs_on_labels = inputs.get("old_per_token_logps")
+            if rollout_log_probs_on_labels is None:
+                raise RuntimeError(
+                    "MiniLLM reverse KL advantage requires `old_per_token_logps`, but it was not found in the inputs."
                 )
-            else:
-                raise ValueError(f"Unknown reverse_kl_estimator: {self.reverse_kl_estimator}")
+            reverse_kl_teacher_log_probs = teacher_log_probs_on_labels
 
             reverse_kl_advantage = self._compute_advantage(
                 student_log_probs_on_labels=rollout_log_probs_on_labels,
@@ -594,7 +692,6 @@ class MiniLLMTrainer(GRPOTrainer):
                 )
                 reverse_kl_advantage = reverse_kl_advantage * dual_gate
 
-                mode = "train" if self.model.training else "eval"
                 mask_float = mask.float()
                 valid_count = mask_float.sum().clamp(min=1.0)
                 valid_mask = mask.bool()
@@ -656,7 +753,28 @@ class MiniLLMTrainer(GRPOTrainer):
             inputs["advantages"] = inputs["advantages"].unsqueeze(1) + reverse_kl_advantage
 
         # Compute GRPO loss on verifiable reward
-        loss = self._compute_loss(model, inputs)
+        grpo_loss = self._compute_loss(model, inputs)
+        loss = grpo_loss
+
+        if self.distill_mode == "student_topp_reverse_kl":
+            self._metrics[mode]["reverse_kl/grpo_loss"].append(
+                self.accelerator.gather(grpo_loss.detach()).nanmean().item()
+            )
+
+        if self.distill_mode in {"reverse_kl", "student_topp_reverse_kl"}:
+            support_distill_loss = self._compute_support_distill_loss(
+                student_logits=student_logits,
+                teacher_logits=teacher_logits,
+                mask=mask,
+            )
+            weighted_support_distill_loss = self.support_loss_coef * support_distill_loss
+
+            if self.distill_mode == "reverse_kl":
+                self._metrics[mode]["student_topp_reverse_kl/weighted_support_loss"].append(
+                    self.accelerator.gather(weighted_support_distill_loss.detach()).nanmean().item()
+                )
+            elif self.distill_mode == "student_topp_reverse_kl":
+                loss += weighted_support_distill_loss
 
         # Compute loss
         if self.single_step_decomposition:
@@ -673,6 +791,12 @@ class MiniLLMTrainer(GRPOTrainer):
 
         # Return loss
         return (loss, student_outputs) if return_outputs else loss
+
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        inputs = self._prepare_inputs(inputs)
+        with torch.no_grad():
+            loss = torch.zeros((), device=self.accelerator.device)
+        return loss, None, None
 
     def _save_checkpoint(self, model, trial):
         super()._save_checkpoint(model, trial)

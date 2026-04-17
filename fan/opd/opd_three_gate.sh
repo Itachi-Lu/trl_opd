@@ -21,14 +21,15 @@ export WANDB_NAME="${WANDB_NAME:-2026_4_9_three_gate}"
 accelerate launch \
   --config_file /apdcephfs_qy4/share_302593112/shaofanliu/projects/lzh/trl/examples/accelerate_configs/deepspeed_zero3.yaml \
   opd.py \
-  --model_name_or_path /apdcephfs_qy4_302593112/share_302593112/shaofanliu/projects/lzh/trl/fan/SFT/output_qwen3_1_7base_capybara/checkpoint-247 \
+  --model_name_or_path /apdcephfs_zwfy2/share_302970870/shaofanliu/projects/lzh/trl/fan/SFT/output_qwen3_1_7base_capybara/checkpoint-247 \
   --tokenizer_name_or_path Qwen/Qwen3-1.7B \
-  --teacher_model_name_or_path Qwen/Qwen3-8B \
+  --teacher_model_name_or_path /apdcephfs_zwfy2/share_302970870/shaofanliu/models/Qwen3-8B \
   --dataset_name qwedsacf/competition_math \
   --dataset_train_split train \
   --dataset_eval_split none \
+  --distill_mode reverse_kl \
   --enable_thinking false \
-  --output_dir outputs/opd-qwen3_1_7base_capybarasft-from-8b-paper-three-gate \
+  --output_dir /apdcephfs_zwfy2/share_302970870/shaofanliu/projects/opd_ckpt/opd_three_gate \
   --learning_rate 3e-6 \
   --lr_scheduler_type cosine \
   --num_train_epochs 3 \
