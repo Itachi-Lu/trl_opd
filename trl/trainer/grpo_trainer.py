@@ -2423,7 +2423,15 @@ class GRPOTrainer(_BaseTrainer):
             per_token_loss = per_token_loss + self.beta * per_token_kl
 
         mode = "train" if self.model.training else "eval"
-        if self.loss_type in ["grpo", "sapo"]:
+        token_loss_weights = inputs.get("token_loss_weights")
+        if token_loss_weights is not None:
+            reduction_weights = token_loss_weights.to(device=per_token_loss.device, dtype=per_token_loss.dtype) * mask
+            global_weight_sum = self.accelerator.gather(reduction_weights.sum().detach()).sum()
+            normalizer = (global_weight_sum / self.accelerator.num_processes).clamp_min(1e-8)
+            loss = (per_token_loss * reduction_weights).sum() / normalizer
+            if mode == "train":
+                loss = loss / self.current_gradient_accumulation_steps
+        elif self.loss_type in ["grpo", "sapo"]:
             loss = ((per_token_loss * mask).sum(-1) / mask.sum(-1).clamp(min=1.0)).mean()
             normalizer = self.current_gradient_accumulation_steps if mode == "train" else 1.0  # no accum in eval
             loss = loss / normalizer

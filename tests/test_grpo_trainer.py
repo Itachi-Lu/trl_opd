@@ -15,6 +15,7 @@
 import gc
 import os
 import warnings
+from collections import defaultdict
 from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -310,6 +311,49 @@ class TestGRPOTrainer(TrlTestCase):
         for n, param in previous_trainable_params.items():
             new_param = trainer.model.get_parameter(n)
             assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
+
+    def test_token_loss_weights_use_weighted_token_mean(self):
+        class DummyAccelerator:
+            num_processes = 1
+
+            @staticmethod
+            def gather(value):
+                return value
+
+        trainer = object.__new__(GRPOTrainer)
+        trainer.model = torch.nn.Linear(1, 1)
+        trainer.top_entropy_quantile = 1.0
+        trainer.importance_sampling_level = "token"
+        trainer.loss_type = "dapo"
+        trainer.beta = 0.0
+        trainer.off_policy_mask_threshold = None
+        trainer.use_vllm = False
+        trainer.vllm_importance_sampling_correction = False
+        trainer.current_gradient_accumulation_steps = 1
+        trainer.epsilon_low = 0.2
+        trainer.epsilon_high = 0.2
+        trainer.args = SimpleNamespace(delta=None)
+        trainer.accelerator = DummyAccelerator()
+        trainer._metrics = defaultdict(lambda: defaultdict(list))
+        trainer._get_per_token_logps_and_entropies = lambda *args, **kwargs: (
+            torch.zeros((1, 2), dtype=torch.float32),
+            torch.ones((1, 2), dtype=torch.float32),
+        )
+
+        inputs = {
+            "prompt_ids": torch.tensor([[0]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "advantages": torch.tensor([[1.0, 3.0]], dtype=torch.float32),
+            "old_per_token_logps": torch.zeros((1, 2), dtype=torch.float32),
+            "num_items_in_batch": torch.tensor(2.0),
+            "token_loss_weights": torch.tensor([[0.25, 0.75]], dtype=torch.float32),
+        }
+
+        loss = trainer._compute_loss(trainer.model, inputs)
+
+        assert torch.isclose(loss, torch.tensor(-2.5))
 
     def test_training_with_eval(self):
         dataset = load_dataset("trl-internal-testing/zen", "standard_prompt_only")

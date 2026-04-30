@@ -60,6 +60,13 @@ class MiniLLMConfig(GRPOConfig):
         support_loss_teacher_entropy_weighting (`str | None`, *optional*, defaults to `None`):
             Optional teacher-entropy weighting applied after teacher-mass weighting. Supported values are `None`,
             `"teacher_entropy_full_vocab"`, and `"teacher_entropy_support"`.
+        da_opd_weighting (`bool`, *optional*, defaults to `False`):
+            Whether to apply drift-aware token-level weighting to the OPD loss.
+        da_opd_tau (`float`, *optional*, defaults to `2.0`):
+            Temperature used when mapping prefix log-probability drift to DA-OPD token weights.
+        opd_use_reward_advantage (`bool`, *optional*, defaults to `False`):
+            Whether to keep task reward advantages in the OPD training loss. When disabled, rewards are still logged
+            but do not contribute to the loss.
         use_dual_gate (`bool`, *optional*, defaults to `False`):
             Whether to apply dual teacher/student token gating to the distillation advantage.
         use_gate_bonus (`bool`, *optional*, defaults to `True`):
@@ -149,6 +156,21 @@ class MiniLLMConfig(GRPOConfig):
             "'teacher_entropy_full_vocab', and 'teacher_entropy_support'."
         },
     )
+    da_opd_weighting: bool = field(
+        default=False,
+        metadata={"help": "Whether to apply drift-aware token-level weighting to the OPD loss."},
+    )
+    da_opd_tau: float = field(
+        default=2.0,
+        metadata={"help": "Temperature used to map prefix log-probability drift to DA-OPD token weights."},
+    )
+    opd_use_reward_advantage: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to keep task reward advantages in the OPD training loss. Rewards are still logged when "
+            "this is disabled."
+        },
+    )
 
     use_dual_gate: bool = field(
         default=False,
@@ -224,6 +246,8 @@ class MiniLLMConfig(GRPOConfig):
                 "{None, 'teacher_entropy_full_vocab', 'teacher_entropy_support'}, but got "
                 f"{self.support_loss_teacher_entropy_weighting!r}."
             )
+        if self.da_opd_tau <= 0.0:
+            raise ValueError(f"da_opd_tau must be > 0, but got {self.da_opd_tau}.")
 
         num_processes = self.world_size
         # The current default effective batch size

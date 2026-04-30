@@ -17,6 +17,7 @@ from collections import defaultdict
 import pytest
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from datasets import load_dataset
 
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
@@ -46,12 +47,15 @@ def make_support_loss_trainer(
 @pytest.mark.low_priority
 class TestMiniLLMTrainer(TrlTestCase):
     def test_config_distill_mode_defaults_to_reverse_kl(self):
-        config = MiniLLMConfig(output_dir=self.tmp_dir, report_to="none", num_generations=1)
+        config = MiniLLMConfig(output_dir=self.tmp_dir, report_to="none", num_generations=1, use_cpu=True)
 
         assert config.distill_mode == "reverse_kl"
         assert config.support_top_p == pytest.approx(0.95)
         assert config.support_min_k == 32
         assert config.support_loss_coef == pytest.approx(1.0)
+        assert config.da_opd_weighting is False
+        assert config.da_opd_tau == pytest.approx(2.0)
+        assert config.opd_use_reward_advantage is False
 
     def test_train(self):
         # Get the dataset
@@ -97,6 +101,21 @@ class TestMiniLLMTrainer(TrlTestCase):
 
         expected = torch.tensor([[True, False, False], [True, False, False]])
         assert torch.equal(mask, expected)
+
+    def test_da_opd_weights_use_shifted_prefix_drift_and_mask(self):
+        trainer = object.__new__(MiniLLMTrainer)
+        trainer.da_opd_tau = 2.0
+        teacher_logps = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float32)
+        student_logps = torch.tensor([[-1.0, -4.0, -1.0]], dtype=torch.float32, requires_grad=True)
+        mask = torch.tensor([[True, True, False]])
+
+        weights, rho = trainer._compute_da_opd_token_weights(teacher_logps, student_logps, mask)
+
+        expected_rho = torch.tensor([[0.0, 2.0, 2.0]], dtype=torch.float32)
+        expected_weights = torch.tensor([[0.5, 0.5, 0.0]], dtype=torch.float32)
+        assert torch.allclose(rho, expected_rho)
+        assert torch.allclose(weights, expected_weights)
+        assert weights.requires_grad is False
 
     def test_dual_gate_respects_padding_and_preserves_scale(self):
         trainer = object.__new__(MiniLLMTrainer)
@@ -155,6 +174,31 @@ class TestMiniLLMTrainer(TrlTestCase):
         loss = trainer._compute_support_distill_loss(student_logits, teacher_logits, mask)
 
         assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
+    def test_support_distill_loss_uses_da_opd_weighted_denominator(self):
+        trainer = make_support_loss_trainer(support_top_p=1.0, support_min_k=2)
+        student_logits = torch.log(
+            torch.tensor(
+                [[[0.80, 0.20], [0.60, 0.40], [0.50, 0.50]]],
+                dtype=torch.float32,
+            )
+        )
+        teacher_logits = torch.log(
+            torch.tensor(
+                [[[0.50, 0.50], [0.30, 0.70], [0.50, 0.50]]],
+                dtype=torch.float32,
+            )
+        )
+        mask = torch.tensor([[True, True, False]])
+        token_weights = torch.tensor([[0.25, 0.75, 0.0]], dtype=torch.float32)
+
+        loss = trainer._compute_support_distill_loss(student_logits, teacher_logits, mask, token_weights=token_weights)
+
+        student_log_probs = F.log_softmax(student_logits, dim=-1)
+        teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
+        per_token_loss = (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        expected = (per_token_loss * token_weights).sum() / token_weights.sum()
+        assert torch.isclose(loss, expected, atol=1e-6)
 
     def test_support_filter_excludes_pad_and_eos_only_for_student_topp_reverse_kl(self):
         trainer = make_support_loss_trainer(pad_token_id=0, eos_token_id=1)
@@ -236,6 +280,10 @@ class TestMiniLLMTrainer(TrlTestCase):
         trainer.support_loss_use_teacher_mass_weighting = False
         trainer.support_loss_teacher_entropy_weighting = None
         trainer.use_dual_gate = False
+        trainer.da_opd_weighting = False
+        trainer.opd_use_reward_advantage = False
+        trainer.gamma = 0.0
+        trainer.length_normalization = True
         trainer.accelerator = DummyAccelerator()
         trainer._metrics = defaultdict(lambda: defaultdict(list))
         trainer._log_teacher_mass_metrics = lambda *args, **kwargs: None
@@ -263,3 +311,85 @@ class TestMiniLLMTrainer(TrlTestCase):
 
         assert torch.isfinite(loss)
         assert loss.item() > 0.0
+
+    def test_reverse_kl_da_opd_zeroes_reward_advantage_and_passes_token_weights(self):
+        class DummyCausalLM(nn.Module):
+            def __init__(self, logits: torch.Tensor):
+                super().__init__()
+                self.register_buffer("fixed_logits", logits)
+
+            def forward(self, input_ids=None, attention_mask=None, use_cache=False):
+                batch_size = input_ids.size(0)
+                logits = self.fixed_logits.expand(batch_size, -1, -1).clone()
+                return type("DummyOutput", (), {"logits": logits})()
+
+        class DummyAccelerator:
+            device = torch.device("cpu")
+
+            @staticmethod
+            def gather(value):
+                return value
+
+            @staticmethod
+            def pad_across_processes(value, dim=0, pad_index=0):
+                return value
+
+        teacher_logits = torch.log(
+            torch.tensor(
+                [[[0.70, 0.20, 0.10], [0.60, 0.30, 0.10], [0.20, 0.70, 0.10], [0.20, 0.20, 0.60]]],
+                dtype=torch.float32,
+            )
+        )
+        student_logits = torch.log(
+            torch.tensor(
+                [[[0.60, 0.30, 0.10], [0.50, 0.40, 0.10], [0.30, 0.60, 0.10], [0.30, 0.20, 0.50]]],
+                dtype=torch.float32,
+            )
+        )
+
+        trainer = object.__new__(MiniLLMTrainer)
+        trainer.teacher_model = DummyCausalLM(teacher_logits)
+        trainer.kd_temperature = 1.0
+        trainer.distill_mode = "reverse_kl"
+        trainer.rkl_advantage = True
+        trainer.single_step_decomposition = False
+        trainer.support_loss_coef = 1.0
+        trainer.use_dual_gate = False
+        trainer.da_opd_weighting = True
+        trainer.da_opd_tau = 2.0
+        trainer.opd_use_reward_advantage = False
+        trainer.gamma = 0.0
+        trainer.length_normalization = True
+        trainer.accelerator = DummyAccelerator()
+        trainer._metrics = defaultdict(lambda: defaultdict(list))
+        trainer._log_teacher_mass_metrics = lambda *args, **kwargs: None
+        trainer._log_teacher_entropy_metrics = lambda *args, **kwargs: None
+        trainer._compute_support_distill_loss = lambda *args, **kwargs: torch.zeros((), dtype=torch.float32)
+        captured_inputs = {}
+
+        def capture_compute_loss(model, inputs):
+            captured_inputs.update(inputs)
+            return torch.zeros((), dtype=torch.float32)
+
+        trainer._compute_loss = capture_compute_loss
+        model = DummyCausalLM(student_logits)
+        inputs = {
+            "prompt_ids": torch.tensor([[0, 1]], dtype=torch.long),
+            "completion_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "prompt_mask": torch.tensor([[1, 1]], dtype=torch.long),
+            "completion_mask": torch.tensor([[1, 0]], dtype=torch.long),
+            "advantages": torch.tensor([5.0], dtype=torch.float32),
+            "old_per_token_logps": torch.tensor([[-0.8, -0.4]], dtype=torch.float32),
+        }
+        trainer.model = model
+
+        loss = trainer.compute_loss(model, inputs)
+
+        assert torch.isfinite(loss)
+        assert "token_loss_weights" in captured_inputs
+        assert captured_inputs["advantages"].shape == torch.Size([1, 2])
+        expected_teacher_on_labels = torch.tensor([[torch.log(torch.tensor(0.30)), torch.log(torch.tensor(0.10))]])
+        expected_reverse_kl_advantage = expected_teacher_on_labels - inputs["old_per_token_logps"]
+        expected_reverse_kl_advantage = expected_reverse_kl_advantage * inputs["completion_mask"].float()
+        assert torch.allclose(captured_inputs["advantages"], expected_reverse_kl_advantage)
+        assert torch.allclose(captured_inputs["token_loss_weights"], torch.tensor([[0.5, 0.0]]))

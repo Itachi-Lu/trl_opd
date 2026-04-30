@@ -249,6 +249,9 @@ class MiniLLMTrainer(GRPOTrainer):
         self.support_loss_coef = args.support_loss_coef
         self.support_loss_use_teacher_mass_weighting = args.support_loss_use_teacher_mass_weighting
         self.support_loss_teacher_entropy_weighting = args.support_loss_teacher_entropy_weighting
+        self.da_opd_weighting = args.da_opd_weighting
+        self.da_opd_tau = args.da_opd_tau
+        self.opd_use_reward_advantage = args.opd_use_reward_advantage
         self.use_dual_gate = args.use_dual_gate
         self.use_gate_bonus = args.use_gate_bonus
         self.gate_teacher_entropy_lambda = args.gate_teacher_entropy_lambda
@@ -369,6 +372,53 @@ class MiniLLMTrainer(GRPOTrainer):
         if "tool_mask" in inputs:
             mask = mask & inputs["tool_mask"].bool()
         return mask
+
+    def _compute_da_opd_token_weights(
+        self,
+        teacher_token_logprobs: torch.Tensor,
+        student_token_logprobs: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        mask_float = mask.float()
+        logprob_ratio = (teacher_token_logprobs - student_token_logprobs) * mask_float
+        rho = logprob_ratio.cumsum(dim=-1)
+        rho_prefix = torch.cat([torch.zeros_like(rho[:, :1]), rho[:, :-1]], dim=-1)
+        weights = torch.sigmoid(rho_prefix / self.da_opd_tau).detach() * mask_float
+        return weights, rho
+
+    def _log_da_opd_metrics(self, rho: torch.Tensor, weights: torch.Tensor, mask: torch.Tensor, mode: str) -> None:
+        valid_mask = mask.bool()
+        rho_valid = rho.detach().float()[valid_mask]
+        weight_valid = weights.detach().float()[valid_mask]
+
+        if rho_valid.numel() == 0:
+            rho_valid = torch.full((1,), float("nan"), device=rho.device)
+        if weight_valid.numel() == 0:
+            weight_valid = torch.full((1,), float("nan"), device=weights.device)
+
+        rho_valid = self.accelerator.gather(
+            self.accelerator.pad_across_processes(rho_valid, dim=0, pad_index=float("nan"))
+        )
+        weight_valid = self.accelerator.gather(
+            self.accelerator.pad_across_processes(weight_valid, dim=0, pad_index=float("nan"))
+        )
+        rho_valid = rho_valid[~torch.isnan(rho_valid)]
+        weight_valid = weight_valid[~torch.isnan(weight_valid)]
+
+        def safe_stats(values: torch.Tensor, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if values.numel() == 0:
+                zero = torch.zeros((), device=device)
+                return zero, zero, zero
+            return values.mean(), values.min(), values.max()
+
+        rho_mean, rho_min, rho_max = safe_stats(rho_valid, rho.device)
+        weight_mean, weight_min, weight_max = safe_stats(weight_valid, weights.device)
+        self._metrics[mode]["da_opd/rho_mean"].append(rho_mean.item())
+        self._metrics[mode]["da_opd/rho_min"].append(rho_min.item())
+        self._metrics[mode]["da_opd/rho_max"].append(rho_max.item())
+        self._metrics[mode]["da_opd/weight_mean"].append(weight_mean.item())
+        self._metrics[mode]["da_opd/weight_min"].append(weight_min.item())
+        self._metrics[mode]["da_opd/weight_max"].append(weight_max.item())
 
     def _build_student_topp_support(
         self, student_logits: torch.Tensor, top_p: float, min_k: int
@@ -605,6 +655,7 @@ class MiniLLMTrainer(GRPOTrainer):
         student_logits: torch.Tensor,
         teacher_logits: torch.Tensor,
         mask: torch.Tensor,
+        token_weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
         support_indices, local_support_mask = self._build_support_tensors(
             student_logits,
@@ -637,6 +688,9 @@ class MiniLLMTrainer(GRPOTrainer):
             per_token_loss = per_token_loss * teacher_entropy_weight
 
         mask_float = mask.float()
+        if token_weights is not None:
+            reduction_weights = token_weights.to(dtype=per_token_loss.dtype) * mask_float
+            return (per_token_loss * reduction_weights).sum() / reduction_weights.sum().clamp_min(1e-8)
         return (per_token_loss * mask_float).sum() / mask_float.sum().clamp(min=1.0)
 
     def _compute_dual_gate(
@@ -828,6 +882,23 @@ class MiniLLMTrainer(GRPOTrainer):
         self._log_teacher_mass_metrics(student_logits, teacher_log_probs, mask, mode)
         self._log_teacher_entropy_metrics(student_logits, teacher_log_probs, mask, mode)
 
+        if not self.opd_use_reward_advantage:
+            inputs["advantages"] = torch.zeros_like(inputs["advantages"])
+
+        da_opd_token_weights = None
+        if self.da_opd_weighting:
+            rollout_log_probs_on_labels = inputs.get("old_per_token_logps")
+            if rollout_log_probs_on_labels is None:
+                raise RuntimeError(
+                    "DA-OPD weighting requires `old_per_token_logps`, but it was not found in the inputs."
+                )
+            da_opd_token_weights, da_opd_rho = self._compute_da_opd_token_weights(
+                teacher_token_logprobs=teacher_log_probs_on_labels,
+                student_token_logprobs=rollout_log_probs_on_labels,
+                mask=mask,
+            )
+            self._log_da_opd_metrics(da_opd_rho, da_opd_token_weights, mask, mode)
+
         if self.distill_mode == "reverse_kl" and self.rkl_advantage:
             rollout_log_probs_on_labels = inputs.get("old_per_token_logps")
             if rollout_log_probs_on_labels is None:
@@ -907,6 +978,8 @@ class MiniLLMTrainer(GRPOTrainer):
 
             reverse_kl_advantage = reverse_kl_advantage.detach()
             inputs["advantages"] = inputs["advantages"].unsqueeze(1) + reverse_kl_advantage
+            if da_opd_token_weights is not None:
+                inputs["token_loss_weights"] = da_opd_token_weights
 
         # Compute GRPO loss on verifiable reward
         grpo_loss = self._compute_loss(model, inputs)
@@ -922,6 +995,7 @@ class MiniLLMTrainer(GRPOTrainer):
                 student_logits=student_logits,
                 teacher_logits=teacher_logits,
                 mask=mask,
+                token_weights=da_opd_token_weights,
             )
             weighted_support_distill_loss = self.support_loss_coef * support_distill_loss
 
