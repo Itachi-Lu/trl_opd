@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import multiprocessing as mp
 import json
 import os
+import signal
 import shutil
 import sys
+import time
 from pathlib import Path
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, TimeoutError
 
 import pandas as pd
 
@@ -39,6 +42,8 @@ _DP_WORKER_LLM_KEY = None
 _DP_WORKER_SAMPLING_PARAMS = None
 _DP_WORKER_SAMPLING_KEY = None
 _DP_WORKER_GPU_ID = None
+
+DEFAULT_STOP_TOKEN_IDS = [151643, 151645]
 
 
 def load_samples(parquet_path: Path) -> list[dict]:
@@ -121,12 +126,17 @@ def _split_samples(samples: list[dict], num_shards: int) -> list[list[dict]]:
 
 
 def _sampling_params_to_dict(sampling_params) -> dict:
-    return {
+    sampling_cfg = {
         "n": int(sampling_params.n),
         "temperature": float(sampling_params.temperature),
         "top_p": float(sampling_params.top_p),
         "max_tokens": int(sampling_params.max_tokens),
+        "stop_token_ids": list(getattr(sampling_params, "stop_token_ids", DEFAULT_STOP_TOKEN_IDS)),
     }
+    seed = getattr(sampling_params, "seed", None)
+    if seed is not None:
+        sampling_cfg["seed"] = int(seed)
+    return sampling_cfg
 
 
 def _dp_worker_generate(
@@ -194,6 +204,12 @@ def _dp_worker_generate(
 def _dp_worker_init(gpu_id: str, worker_index: int = 0):
     global _DP_WORKER_GPU_ID
     _DP_WORKER_GPU_ID = str(gpu_id)
+    try:
+        # Put each DP worker in its own process group so the parent can
+        # reliably terminate any vLLM child processes during teardown.
+        os.setsid()
+    except OSError:
+        pass
     os.environ["CUDA_VISIBLE_DEVICES"] = _DP_WORKER_GPU_ID
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     # Assign a unique RPC base port per worker to avoid TCPStore port collision
@@ -226,17 +242,20 @@ def _dp_worker_warmup(
 def _dp_worker_cleanup() -> str:
     """Cleanup LLM object in DP worker subprocess to allow graceful shutdown."""
     global _DP_WORKER_LLM
+    global _DP_WORKER_LLM_KEY
     global _DP_WORKER_SAMPLING_PARAMS
+    global _DP_WORKER_SAMPLING_KEY
 
     if _DP_WORKER_LLM is not None:
         del _DP_WORKER_LLM
         _DP_WORKER_LLM = None
+        _DP_WORKER_LLM_KEY = None
 
     if _DP_WORKER_SAMPLING_PARAMS is not None:
         del _DP_WORKER_SAMPLING_PARAMS
         _DP_WORKER_SAMPLING_PARAMS = None
+        _DP_WORKER_SAMPLING_KEY = None
 
-    import gc
     gc.collect()
 
     try:
@@ -247,6 +266,80 @@ def _dp_worker_cleanup() -> str:
         pass
 
     return "cleaned"
+
+
+def _get_executor_processes(executor: ProcessPoolExecutor) -> list:
+    return [
+        proc for proc in getattr(executor, "_processes", {}).values()
+        if proc is not None
+    ]
+
+
+def _wait_for_processes(processes: list, timeout_s: float) -> list:
+    deadline = time.monotonic() + timeout_s
+    alive = []
+    for proc in processes:
+        remaining = max(0.0, deadline - time.monotonic())
+        proc.join(remaining)
+        if proc.is_alive():
+            alive.append(proc)
+    return alive
+
+
+def _signal_processes(processes: list, sig: signal.Signals):
+    for proc in processes:
+        if not proc.is_alive():
+            continue
+        try:
+            os.killpg(proc.pid, sig)
+            continue
+        except Exception:
+            pass
+
+        try:
+            if sig == signal.SIGTERM:
+                proc.terminate()
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+
+def _shutdown_dp_executor(gpu_id: str, executor: ProcessPoolExecutor):
+    processes = _get_executor_processes(executor)
+    executor.shutdown(wait=False, cancel_futures=True)
+
+    alive = _wait_for_processes(processes, timeout_s=10.0)
+    if not alive:
+        print(f"DP worker on GPU {gpu_id} exited cleanly.")
+        return
+
+    alive_pids = [str(proc.pid) for proc in alive]
+    print(
+        f"WARNING: DP worker on GPU {gpu_id} did not exit after cleanup; "
+        f"sending SIGTERM to pids {', '.join(alive_pids)}"
+    )
+    _signal_processes(alive, signal.SIGTERM)
+    alive = _wait_for_processes(alive, timeout_s=5.0)
+    if not alive:
+        print(f"DP worker on GPU {gpu_id} exited after SIGTERM.")
+        return
+
+    alive_pids = [str(proc.pid) for proc in alive]
+    print(
+        f"WARNING: DP worker on GPU {gpu_id} still alive after SIGTERM; "
+        f"sending SIGKILL to pids {', '.join(alive_pids)}"
+    )
+    _signal_processes(alive, signal.SIGKILL)
+    alive = _wait_for_processes(alive, timeout_s=5.0)
+    if alive:
+        alive_pids = [str(proc.pid) for proc in alive]
+        print(
+            f"WARNING: DP worker on GPU {gpu_id} is still alive after SIGKILL: "
+            f"{', '.join(alive_pids)}"
+        )
+    else:
+        print(f"DP worker on GPU {gpu_id} exited after SIGKILL.")
 
 
 def _generate_completions_dp(
@@ -260,6 +353,10 @@ def _generate_completions_dp(
 ) -> list[dict]:
     sampling_cfg = _sampling_params_to_dict(sampling_params)
     shards = _split_samples(samples, len(dp_executors))
+    print(
+        f"  Generating {sampling_params.n} completions for {len(samples)} prompts "
+        f"across {len(shards)} DP shard(s) ..."
+    )
     futures = []
     for shard_idx, shard in enumerate(shards):
         _, executor = dp_executors[shard_idx % len(dp_executors)]
@@ -274,18 +371,44 @@ def _generate_completions_dp(
         ))
 
     records = []
-    for future in futures:
-        records.extend(future.result())
+    for shard_idx, future in enumerate(futures, start=1):
+        shard_records = future.result()
+        records.extend(shard_records)
+        print(
+            f"    Collected shard {shard_idx}/{len(futures)}: "
+            f"{len(shard_records)} completions"
+        )
     return records
 
 
-def grade_records(records: list[dict], scorer: str) -> list[dict]:
-    score_fn = score_aime_like if scorer == "aime" else score_mathlike
-    for rec in records:
-        score, pred_norm, gold_norm = score_fn(response=rec["response"], ground_truth=rec["answer"])
+def grade_records(
+    records: list[dict],
+    scorer: str,
+    dataset_name: str,
+    math_equal_timeout: float,
+) -> list[dict]:
+    total = len(records)
+    progress_interval = 1000 if total >= 1000 else max(1, total)
+    print(f"  Grading {total} records for {dataset_name} with scorer={scorer} ...")
+    start_time = time.monotonic()
+    for idx, rec in enumerate(records, start=1):
+        if scorer == "aime":
+            score, pred_norm, gold_norm = score_aime_like(
+                response=rec["response"],
+                ground_truth=rec["answer"],
+            )
+        else:
+            score, pred_norm, gold_norm = score_mathlike(
+                response=rec["response"],
+                ground_truth=rec["answer"],
+                math_equal_timeout=math_equal_timeout,
+            )
         rec["score"] = float(score)
         rec["pred_norm"] = pred_norm
         rec["gold_norm"] = gold_norm
+        if idx % progress_interval == 0 or idx == total:
+            elapsed = time.monotonic() - start_time
+            print(f"    Graded {idx}/{total} records ({elapsed:.1f}s elapsed)")
     return records
 
 
@@ -437,6 +560,7 @@ def build_llm_and_sampling_params(
     temperature: float,
     top_p: float,
     max_tokens: int,
+    sampling_seed: int,
 ):
     from vllm import LLM, SamplingParams
 
@@ -453,6 +577,8 @@ def build_llm_and_sampling_params(
         temperature=temperature,
         top_p=top_p,
         max_tokens=max_tokens,
+        stop_token_ids=DEFAULT_STOP_TOKEN_IDS,
+        seed=sampling_seed,
     )
     return llm, sampling_params
 
@@ -475,12 +601,14 @@ def main():
                         help="Comma-separated dataset names.")
     parser.add_argument("--k", type=int, default=32, help="Number of completions per prompt for pass@k.")
     parser.add_argument("--temperature", type=float, default=1.0)
-    parser.add_argument("--top_p", type=float, default=0.95)
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--top_p", type=float, default=0.8)
+    parser.add_argument("--max_tokens", type=int, default=8192)
     parser.add_argument("--tensor_parallel_size", type=int, default=None,
                         help="Number of GPUs for tensor parallel. Defaults to all visible GPUs.")
     parser.add_argument("--data_parallel_size", type=int, default=1,
                         help="Number of data-parallel vLLM workers (each worker loads a full model, TP=1).")
+    parser.add_argument("--math_equal_timeout", type=float, default=30.0)
+    parser.add_argument("--sampling_seed", type=int, default=42)
     parser.add_argument("--enable_thinking", action="store_true", default=False)
     parser.add_argument("--wandb_project", type=str, default="opd_distill_with_eval")
     parser.add_argument("--wandb_name", type=str, default=None, help="wandb run name. Defaults to model dir name.")
@@ -516,6 +644,8 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
             max_tokens=args.max_tokens,
+            stop_token_ids=DEFAULT_STOP_TOKEN_IDS,
+            seed=args.sampling_seed,
         )
         sampling_cfg = _sampling_params_to_dict(sampling_params)
 
@@ -553,12 +683,15 @@ def main():
             temperature=args.temperature,
             top_p=args.top_p,
             max_tokens=args.max_tokens,
+            sampling_seed=args.sampling_seed,
         )
 
     dataset_names = [n.strip() for n in args.datasets.split(",") if n.strip()]
     print(f"Model: {model_path}")
     print(f"Datasets: {dataset_names}")
     print(f"K={args.k}, temperature={args.temperature}, top_p={args.top_p}, max_tokens={args.max_tokens}")
+    print(f"Math equal timeout: {args.math_equal_timeout}")
+    print(f"Sampling seed: {args.sampling_seed}")
     print(f"Tensor parallel size: {args.tensor_parallel_size}")
     print(f"Data parallel size: {args.data_parallel_size}")
     print(f"Output dir: {output_dir}")
@@ -580,6 +713,8 @@ def main():
         samples = load_samples(parquet_path)
         print(f"  {len(samples)} samples loaded")
 
+        stage_start = time.monotonic()
+        print("  [1/3] Starting generation ...")
         records = generate_completions(
             llm=llm,
             sampling_params=sampling_params,
@@ -590,8 +725,20 @@ def main():
             tokenizer_path=tokenizer_path,
             max_tokens=args.max_tokens,
         )
+        print(
+            f"  [1/3] Generation finished: {len(records)} completions "
+            f"in {time.monotonic() - stage_start:.1f}s"
+        )
 
-        records = grade_records(records, scorer=info["scorer"])
+        stage_start = time.monotonic()
+        print("  [2/3] Starting grading ...")
+        records = grade_records(
+            records,
+            scorer=info["scorer"],
+            dataset_name=ds_name,
+            math_equal_timeout=args.math_equal_timeout,
+        )
+        print(f"  [2/3] Grading finished in {time.monotonic() - stage_start:.1f}s")
 
         scores_per_example = records_to_scores(records, args.k)
         metrics = compute_metrics(scores_per_example, args.k)
@@ -599,7 +746,10 @@ def main():
 
         print(f"  Metrics: { {k: f'{v:.4f}' if isinstance(v, float) else v for k, v in metrics.items()} }")
 
+        stage_start = time.monotonic()
+        print("  [3/3] Writing detail CSV ...")
         save_detail_csv(records, output_dir / f"{ds_name}_details.csv")
+        print(f"  [3/3] Detail CSV finished in {time.monotonic() - stage_start:.1f}s")
 
     save_summary_csv(all_metrics, output_dir / "eval_summary.csv")
 
@@ -616,11 +766,13 @@ def main():
             try:
                 future.result(timeout=30)
                 print(f"DP worker on GPU {gpu_id} cleaned.")
+            except TimeoutError:
+                print(f"WARNING: Cleanup timed out for DP worker on GPU {gpu_id}.")
             except Exception as e:
                 print(f"WARNING: Failed to cleanup DP worker on GPU {gpu_id}: {e}")
 
-        for _, executor in dp_executors:
-            executor.shutdown(wait=False)
+        for gpu_id, executor in dp_executors:
+            _shutdown_dp_executor(gpu_id, executor)
 
     print("\nDone.")
 

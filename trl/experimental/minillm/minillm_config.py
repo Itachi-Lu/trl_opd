@@ -57,6 +57,9 @@ class MiniLLMConfig(GRPOConfig):
         support_loss_use_teacher_mass_weighting (`bool`, *optional*, defaults to `False`):
             Whether to weight each token's support distillation KL by the teacher probability mass assigned to the
             student's support tokens at that position.
+        support_loss_teacher_entropy_weighting (`str | None`, *optional*, defaults to `None`):
+            Optional teacher-entropy weighting applied after teacher-mass weighting. Supported values are `None`,
+            `"teacher_entropy_full_vocab"`, and `"teacher_entropy_support"`.
         use_dual_gate (`bool`, *optional*, defaults to `False`):
             Whether to apply dual teacher/student token gating to the distillation advantage.
         use_gate_bonus (`bool`, *optional*, defaults to `True`):
@@ -139,6 +142,13 @@ class MiniLLMConfig(GRPOConfig):
             "support."
         },
     )
+    support_loss_teacher_entropy_weighting: str | None = field(
+        default=None,
+        metadata={
+            "help": "Optional entropy-based support-loss weighting. Supported values are None, "
+            "'teacher_entropy_full_vocab', and 'teacher_entropy_support'."
+        },
+    )
 
     use_dual_gate: bool = field(
         default=False,
@@ -200,6 +210,20 @@ class MiniLLMConfig(GRPOConfig):
             raise ValueError(f"support_min_k must be >= 1, but got {self.support_min_k}.")
         if self.support_loss_coef < 0.0:
             raise ValueError(f"support_loss_coef must be >= 0, but got {self.support_loss_coef}.")
+        if isinstance(self.support_loss_teacher_entropy_weighting, str):
+            if self.support_loss_teacher_entropy_weighting.lower() == "none":
+                self.support_loss_teacher_entropy_weighting = None
+        valid_support_loss_teacher_entropy_weightings = {
+            None,
+            "teacher_entropy_full_vocab",
+            "teacher_entropy_support",
+        }
+        if self.support_loss_teacher_entropy_weighting not in valid_support_loss_teacher_entropy_weightings:
+            raise ValueError(
+                "support_loss_teacher_entropy_weighting must be one of "
+                "{None, 'teacher_entropy_full_vocab', 'teacher_entropy_support'}, but got "
+                f"{self.support_loss_teacher_entropy_weighting!r}."
+            )
 
         num_processes = self.world_size
         # The current default effective batch size

@@ -248,6 +248,7 @@ class MiniLLMTrainer(GRPOTrainer):
         self.support_min_k = args.support_min_k
         self.support_loss_coef = args.support_loss_coef
         self.support_loss_use_teacher_mass_weighting = args.support_loss_use_teacher_mass_weighting
+        self.support_loss_teacher_entropy_weighting = args.support_loss_teacher_entropy_weighting
         self.use_dual_gate = args.use_dual_gate
         self.use_gate_bonus = args.use_gate_bonus
         self.gate_teacher_entropy_lambda = args.gate_teacher_entropy_lambda
@@ -392,6 +393,53 @@ class MiniLLMTrainer(GRPOTrainer):
         rank_positions = torch.arange(support_width, device=device).view(1, 1, support_width)
         return rank_positions < support_sizes.unsqueeze(-1)
 
+    def _exclude_stop_tokens_from_support(
+        self, support_indices: torch.Tensor, local_support_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.distill_mode != "student_topp_reverse_kl":
+            return support_indices, local_support_mask
+
+        excluded_token_ids = []
+        if getattr(self, "pad_token_id", None) is not None:
+            excluded_token_ids.append(self.pad_token_id)
+        if getattr(self, "eos_token_id", None) is not None:
+            excluded_token_ids.append(self.eos_token_id)
+        if not excluded_token_ids:
+            return support_indices, local_support_mask
+
+        filtered_support_mask = local_support_mask.clone()
+        for token_id in set(excluded_token_ids):
+            filtered_support_mask &= support_indices != token_id
+
+        support_width = support_indices.size(-1)
+        rank_positions = torch.arange(support_width, device=support_indices.device).view(1, 1, support_width)
+        reorder_keys = (~filtered_support_mask).long() * support_width + rank_positions
+        reorder_indices = reorder_keys.argsort(dim=-1)
+        filtered_support_indices = support_indices.gather(dim=-1, index=reorder_indices)
+
+        filtered_support_sizes = filtered_support_mask.sum(dim=-1)
+        filtered_local_support_mask = self._build_local_support_mask(
+            filtered_support_sizes, support_width, support_indices.device
+        )
+        return filtered_support_indices, filtered_local_support_mask
+
+    def _build_support_tensors(
+        self,
+        student_logits: torch.Tensor,
+        top_p: float,
+        min_k: int,
+        exclude_stop_tokens: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topk_indices, support_sizes = self._build_student_topp_support(student_logits, top_p=top_p, min_k=min_k)
+        max_support_size = int(support_sizes.max().item())
+        support_indices = topk_indices[..., :max_support_size]
+        local_support_mask = self._build_local_support_mask(support_sizes, max_support_size, student_logits.device)
+        if exclude_stop_tokens:
+            support_indices, local_support_mask = self._exclude_stop_tokens_from_support(
+                support_indices, local_support_mask
+            )
+        return support_indices, local_support_mask
+
     @staticmethod
     def _compute_teacher_mass(
         teacher_log_probs: torch.Tensor, support_indices: torch.Tensor, local_support_mask: torch.Tensor | None = None
@@ -401,13 +449,86 @@ class MiniLLMTrainer(GRPOTrainer):
             teacher_support_probs = teacher_support_probs * local_support_mask.to(teacher_support_probs.dtype)
         return teacher_support_probs.sum(dim=-1)
 
+    @staticmethod
+    def _map_normalized_entropy_to_weight(
+        normalized_entropy: torch.Tensor, min_weight: float = 0.2, max_weight: float = 2.0
+    ) -> torch.Tensor:
+        normalized_entropy = normalized_entropy.clamp(min=0.0, max=1.0)
+        return max_weight - (max_weight - min_weight) * normalized_entropy
+
+    @staticmethod
+    def _compute_teacher_full_vocab_entropy(teacher_log_probs: torch.Tensor) -> torch.Tensor:
+        teacher_probs = teacher_log_probs.exp()
+        teacher_entropy = -(teacher_probs * teacher_log_probs).sum(dim=-1)
+        vocab_size = teacher_log_probs.size(-1)
+        if vocab_size > 1:
+            teacher_entropy = teacher_entropy / math.log(vocab_size)
+        else:
+            teacher_entropy = torch.zeros_like(teacher_entropy)
+        return teacher_entropy
+
+    @staticmethod
+    def _compute_teacher_support_entropy(
+        teacher_log_probs: torch.Tensor,
+        support_indices: torch.Tensor,
+        local_support_mask: torch.Tensor,
+        teacher_mass: torch.Tensor,
+    ) -> torch.Tensor:
+        teacher_support_probs = teacher_log_probs.gather(dim=-1, index=support_indices).exp()
+        teacher_support_probs = teacher_support_probs * local_support_mask.to(teacher_support_probs.dtype)
+        normalized_teacher_support_probs = teacher_support_probs / teacher_mass.unsqueeze(-1).clamp(min=1e-6)
+        normalized_teacher_support_log_probs = torch.log(normalized_teacher_support_probs.clamp(min=1e-12))
+        teacher_entropy = -(normalized_teacher_support_probs * normalized_teacher_support_log_probs).sum(dim=-1)
+
+        support_sizes = local_support_mask.sum(dim=-1)
+        support_entropy_denominator = torch.log(support_sizes.clamp(min=2).to(dtype=teacher_entropy.dtype))
+        normalized_teacher_entropy = torch.zeros_like(teacher_entropy)
+        valid_support = support_sizes > 1
+        normalized_teacher_entropy = torch.where(
+            valid_support,
+            teacher_entropy / support_entropy_denominator.clamp(min=1e-6),
+            normalized_teacher_entropy,
+        )
+        return normalized_teacher_entropy
+
+    def _compute_teacher_entropy_weight(
+        self,
+        teacher_log_probs: torch.Tensor,
+        support_indices: torch.Tensor,
+        local_support_mask: torch.Tensor,
+        teacher_mass: torch.Tensor,
+    ) -> torch.Tensor | None:
+        if self.support_loss_teacher_entropy_weighting is None:
+            return None
+
+        if self.support_loss_teacher_entropy_weighting == "teacher_entropy_full_vocab":
+            teacher_entropy = self._compute_teacher_full_vocab_entropy(teacher_log_probs)
+            return self._map_normalized_entropy_to_weight(teacher_entropy)
+
+        if self.support_loss_teacher_entropy_weighting == "teacher_entropy_support":
+            teacher_entropy = self._compute_teacher_support_entropy(
+                teacher_log_probs, support_indices, local_support_mask, teacher_mass
+            )
+            return self._map_normalized_entropy_to_weight(teacher_entropy)
+
+        raise ValueError(
+            "Unsupported support_loss_teacher_entropy_weighting: "
+            f"{self.support_loss_teacher_entropy_weighting!r}."
+        )
+
     def _log_masked_distribution_metrics(
         self, prefix: str, values: torch.Tensor, mask: torch.Tensor, mode: str
     ) -> None:
         values = values.detach().float()
-        gathered_values = self.accelerator.gather(values)
-        gathered_mask = self.accelerator.gather(mask.detach().to(dtype=torch.int32)).bool()
-        valid_values = gathered_values[gathered_mask]
+        valid_values = values[mask.bool()]
+
+        # Completion tensors are padded only within each local batch, so their token dimension can differ across
+        # ranks. Gather only the valid entries after flattening, then pad across processes to make the collective safe.
+        if valid_values.numel() == 0:
+            valid_values = torch.full((1,), float("nan"), device=values.device)
+        padded_values = self.accelerator.pad_across_processes(valid_values, dim=0, pad_index=float("nan"))
+        gathered_values = self.accelerator.gather(padded_values)
+        valid_values = gathered_values[~torch.isnan(gathered_values)]
 
         if valid_values.numel() == 0:
             zero = torch.zeros((), device=values.device)
@@ -442,14 +563,42 @@ class MiniLLMTrainer(GRPOTrainer):
                 teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
                 self._log_masked_distribution_metrics(f"teacher_mass/topp_{suffix}", teacher_mass, mask, mode)
 
-            support_indices, support_sizes = self._build_student_topp_support(
-                student_logits, top_p=self.support_top_p, min_k=self.support_min_k
-            )
-            local_support_mask = self._build_local_support_mask(
-                support_sizes, support_indices.size(-1), student_logits.device
+            support_indices, local_support_mask = self._build_support_tensors(
+                student_logits,
+                top_p=self.support_top_p,
+                min_k=self.support_min_k,
+                exclude_stop_tokens=True,
             )
             teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
             self._log_masked_distribution_metrics("teacher_mass/support", teacher_mass, mask, mode)
+
+    def _log_teacher_entropy_metrics(
+        self, student_logits: torch.Tensor, teacher_log_probs: torch.Tensor, mask: torch.Tensor, mode: str
+    ) -> None:
+        with torch.no_grad():
+            mask_float = mask.float()
+            valid_count = mask_float.sum().clamp(min=1.0)
+
+            teacher_full_vocab_entropy = self._compute_teacher_full_vocab_entropy(teacher_log_probs)
+            full_vocab_mean = (teacher_full_vocab_entropy * mask_float).sum() / valid_count
+            self._metrics[mode]["teacher_entropy/full_vocab_mean"].append(
+                self.accelerator.gather(full_vocab_mean).nanmean().item()
+            )
+
+            support_indices, local_support_mask = self._build_support_tensors(
+                student_logits,
+                top_p=self.support_top_p,
+                min_k=self.support_min_k,
+                exclude_stop_tokens=True,
+            )
+            teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
+            teacher_support_entropy = self._compute_teacher_support_entropy(
+                teacher_log_probs, support_indices, local_support_mask, teacher_mass
+            )
+            support_mean = (teacher_support_entropy * mask_float).sum() / valid_count
+            self._metrics[mode]["teacher_entropy/support_mean"].append(
+                self.accelerator.gather(support_mean).nanmean().item()
+            )
 
     def _compute_support_distill_loss(
         self,
@@ -457,12 +606,12 @@ class MiniLLMTrainer(GRPOTrainer):
         teacher_logits: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
-        topk_indices, support_sizes = self._build_student_topp_support(
-            student_logits, top_p=self.support_top_p, min_k=self.support_min_k
+        support_indices, local_support_mask = self._build_support_tensors(
+            student_logits,
+            top_p=self.support_top_p,
+            min_k=self.support_min_k,
+            exclude_stop_tokens=True,
         )
-        max_support_size = int(support_sizes.max().item())
-        support_indices = topk_indices[..., :max_support_size]
-        local_support_mask = self._build_local_support_mask(support_sizes, max_support_size, student_logits.device)
         neg_large = torch.finfo(student_logits.dtype).min
 
         student_support_logits = student_logits.gather(dim=-1, index=support_indices)
@@ -472,14 +621,20 @@ class MiniLLMTrainer(GRPOTrainer):
 
         teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
         teacher_mass = self._compute_teacher_mass(teacher_log_probs, support_indices, local_support_mask)
+        teacher_entropy_weight = self._compute_teacher_entropy_weight(
+            teacher_log_probs, support_indices, local_support_mask, teacher_mass
+        )
 
         local_student_log_probs = F.log_softmax(masked_student_support_logits, dim=-1)
         local_teacher_log_probs = F.log_softmax(masked_teacher_support_logits, dim=-1)
         local_student_probs = local_student_log_probs.exp()
 
         per_token_loss = (local_student_probs * (local_student_log_probs - local_teacher_log_probs)).sum(dim=-1)
+        per_token_loss = per_token_loss * local_support_mask.any(dim=-1).to(per_token_loss.dtype)
         if self.support_loss_use_teacher_mass_weighting:
             per_token_loss = per_token_loss * teacher_mass
+        if teacher_entropy_weight is not None:
+            per_token_loss = per_token_loss * teacher_entropy_weight
 
         mask_float = mask.float()
         return (per_token_loss * mask_float).sum() / mask_float.sum().clamp(min=1.0)
@@ -671,6 +826,7 @@ class MiniLLMTrainer(GRPOTrainer):
         mask = self._get_loss_mask(inputs)
         mode = "train" if self.model.training else "eval"
         self._log_teacher_mass_metrics(student_logits, teacher_log_probs, mask, mode)
+        self._log_teacher_entropy_metrics(student_logits, teacher_log_probs, mask, mode)
 
         if self.distill_mode == "reverse_kl" and self.rkl_advantage:
             rollout_log_probs_on_labels = inputs.get("old_per_token_logps")

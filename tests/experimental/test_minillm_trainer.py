@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections import defaultdict
+
 import pytest
 import torch
 import torch.nn as nn
@@ -20,6 +22,25 @@ from datasets import load_dataset
 from trl.experimental.minillm import MiniLLMConfig, MiniLLMTrainer
 
 from ..testing_utils import TrlTestCase
+
+
+def make_support_loss_trainer(
+    *,
+    distill_mode: str = "student_topp_reverse_kl",
+    support_top_p: float = 0.85,
+    support_min_k: int = 2,
+    pad_token_id: int | None = None,
+    eos_token_id: int | None = None,
+):
+    trainer = object.__new__(MiniLLMTrainer)
+    trainer.distill_mode = distill_mode
+    trainer.support_top_p = support_top_p
+    trainer.support_min_k = support_min_k
+    trainer.support_loss_use_teacher_mass_weighting = False
+    trainer.support_loss_teacher_entropy_weighting = None
+    trainer.pad_token_id = pad_token_id
+    trainer.eos_token_id = eos_token_id
+    return trainer
 
 
 @pytest.mark.low_priority
@@ -120,10 +141,7 @@ class TestMiniLLMTrainer(TrlTestCase):
         assert topk_indices[0, 0, 1].item() == 1
 
     def test_support_reverse_kl_is_zero_when_teacher_matches_student(self):
-        trainer = object.__new__(MiniLLMTrainer)
-        trainer.distill_mode = "student_topp_reverse_kl"
-        trainer.support_top_p = 0.85
-        trainer.support_min_k = 2
+        trainer = make_support_loss_trainer()
 
         student_logits = torch.log(
             torch.tensor(
@@ -138,6 +156,45 @@ class TestMiniLLMTrainer(TrlTestCase):
 
         assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
 
+    def test_support_filter_excludes_pad_and_eos_only_for_student_topp_reverse_kl(self):
+        trainer = make_support_loss_trainer(pad_token_id=0, eos_token_id=1)
+        support_indices = torch.tensor([[[0, 2, 1, 3]]], dtype=torch.long)
+        local_support_mask = torch.tensor([[[True, True, True, False]]])
+
+        filtered_indices, filtered_mask = trainer._exclude_stop_tokens_from_support(support_indices, local_support_mask)
+
+        assert filtered_mask.sum().item() == 1
+        assert filtered_indices[0, 0, 0].item() == 2
+        assert 0 not in filtered_indices[filtered_mask].tolist()
+        assert 1 not in filtered_indices[filtered_mask].tolist()
+
+        reverse_kl_trainer = make_support_loss_trainer(
+            distill_mode="reverse_kl",
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        unchanged_indices, unchanged_mask = reverse_kl_trainer._exclude_stop_tokens_from_support(
+            support_indices, local_support_mask
+        )
+        assert torch.equal(unchanged_indices, support_indices)
+        assert torch.equal(unchanged_mask, local_support_mask)
+
+    def test_support_distill_loss_is_zero_when_filtered_support_is_empty(self):
+        trainer = make_support_loss_trainer(
+            support_top_p=0.95,
+            support_min_k=2,
+            pad_token_id=0,
+            eos_token_id=1,
+        )
+        student_logits = torch.log(torch.tensor([[[0.60, 0.39, 0.01]]], dtype=torch.float32))
+        teacher_logits = torch.log(torch.tensor([[[0.10, 0.80, 0.10]]], dtype=torch.float32))
+        mask = torch.tensor([[True]])
+
+        loss = trainer._compute_support_distill_loss(student_logits, teacher_logits, mask)
+
+        assert torch.isfinite(loss)
+        assert torch.isclose(loss, torch.tensor(0.0), atol=1e-6)
+
     def test_support_distill_reverse_kl_mode_does_not_require_old_topk_cache(self):
         class DummyCausalLM(nn.Module):
             def __init__(self, logits: torch.Tensor):
@@ -148,6 +205,17 @@ class TestMiniLLMTrainer(TrlTestCase):
                 batch_size = input_ids.size(0)
                 logits = self.fixed_logits.expand(batch_size, -1, -1).clone()
                 return type("DummyOutput", (), {"logits": logits})()
+
+        class DummyAccelerator:
+            device = torch.device("cpu")
+
+            @staticmethod
+            def gather(value):
+                return value
+
+            @staticmethod
+            def pad_across_processes(value, dim=0, pad_index=0):
+                return value
 
         trainer = object.__new__(MiniLLMTrainer)
         trainer.teacher_model = DummyCausalLM(
@@ -165,6 +233,13 @@ class TestMiniLLMTrainer(TrlTestCase):
         trainer.support_top_p = 0.85
         trainer.support_min_k = 2
         trainer.support_loss_coef = 1.0
+        trainer.support_loss_use_teacher_mass_weighting = False
+        trainer.support_loss_teacher_entropy_weighting = None
+        trainer.use_dual_gate = False
+        trainer.accelerator = DummyAccelerator()
+        trainer._metrics = defaultdict(lambda: defaultdict(list))
+        trainer._log_teacher_mass_metrics = lambda *args, **kwargs: None
+        trainer._log_teacher_entropy_metrics = lambda *args, **kwargs: None
         trainer._compute_loss = lambda model, inputs: torch.zeros((), dtype=torch.float32)
 
         model = DummyCausalLM(
@@ -182,6 +257,7 @@ class TestMiniLLMTrainer(TrlTestCase):
             "completion_mask": torch.tensor([[1]], dtype=torch.long),
             "advantages": torch.tensor([0.0], dtype=torch.float32),
         }
+        trainer.model = model
 
         loss = trainer.compute_loss(model, inputs)
 
