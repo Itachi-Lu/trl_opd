@@ -593,6 +593,22 @@ class MiniLLMTrainer(GRPOTrainer):
         for suffix, value in metric_tensors.items():
             self._metrics[mode][f"{prefix}/{suffix}"].append(value.item())
 
+    def _log_masked_mean_metric(self, name: str, values: torch.Tensor, mask: torch.Tensor, mode: str) -> None:
+        values = values.detach().float()
+        valid_values = values[mask.bool()]
+
+        if valid_values.numel() == 0:
+            valid_values = torch.full((1,), float("nan"), device=values.device)
+        padded_values = self.accelerator.pad_across_processes(valid_values, dim=0, pad_index=float("nan"))
+        gathered_values = self.accelerator.gather(padded_values)
+        valid_values = gathered_values[~torch.isnan(gathered_values)]
+
+        if valid_values.numel() == 0:
+            mean = torch.zeros((), device=values.device)
+        else:
+            mean = valid_values.mean()
+        self._metrics[mode][f"{name}/mean"].append(mean.item())
+
     def _log_teacher_mass_metrics(
         self, student_logits: torch.Tensor, teacher_log_probs: torch.Tensor, mask: torch.Tensor, mode: str
     ) -> None:
@@ -649,6 +665,54 @@ class MiniLLMTrainer(GRPOTrainer):
             self._metrics[mode]["teacher_entropy/support_mean"].append(
                 self.accelerator.gather(support_mean).nanmean().item()
             )
+
+    @staticmethod
+    def _compute_topk_local_entropy(topk_log_probs: torch.Tensor) -> torch.Tensor:
+        topk_probs = topk_log_probs.exp()
+        normalized_topk_probs = topk_probs / topk_probs.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+        normalized_topk_log_probs = torch.log(normalized_topk_probs.clamp(min=1e-12))
+        entropy = -(normalized_topk_probs * normalized_topk_log_probs).sum(dim=-1)
+        topk_size = topk_log_probs.size(-1)
+        if topk_size > 1:
+            entropy = entropy / math.log(topk_size)
+        else:
+            entropy = torch.zeros_like(entropy)
+        return entropy
+
+    def _log_opd_alignment_metrics(
+        self, student_log_probs: torch.Tensor, teacher_log_probs: torch.Tensor, mask: torch.Tensor, mode: str
+    ) -> None:
+        with torch.no_grad():
+            max_topk = min(32, student_log_probs.size(-1))
+            student_topk_log_probs, student_topk_indices = student_log_probs.detach().topk(max_topk, dim=-1)
+            teacher_topk_log_probs, teacher_topk_indices = teacher_log_probs.detach().topk(max_topk, dim=-1)
+
+            for k in (8, 16, 32):
+                current_k = min(k, max_topk)
+                student_indices = student_topk_indices[..., :current_k]
+                teacher_indices = teacher_topk_indices[..., :current_k]
+                student_log_probs_k = student_topk_log_probs[..., :current_k]
+                teacher_log_probs_k = teacher_topk_log_probs[..., :current_k]
+
+                student_overlap_mask = (student_indices.unsqueeze(-1) == teacher_indices.unsqueeze(-2)).any(dim=-1)
+                teacher_overlap_mask = (teacher_indices.unsqueeze(-1) == student_indices.unsqueeze(-2)).any(dim=-1)
+
+                overlap_ratio = student_overlap_mask.float().sum(dim=-1) / current_k
+                student_overlap_mass = (student_log_probs_k.exp() * student_overlap_mask).sum(dim=-1)
+                teacher_overlap_mass = (teacher_log_probs_k.exp() * teacher_overlap_mask).sum(dim=-1)
+
+                student_entropy = self._compute_topk_local_entropy(student_log_probs_k)
+                teacher_entropy = self._compute_topk_local_entropy(teacher_log_probs_k)
+                entropy_gap = torch.abs(student_entropy - teacher_entropy)
+
+                self._log_masked_mean_metric(f"opd/overlap_ratio/topk_{k}", overlap_ratio, mask, mode)
+                self._log_masked_mean_metric(
+                    f"opd/student_overlap_mass/topk_{k}", student_overlap_mass, mask, mode
+                )
+                self._log_masked_mean_metric(
+                    f"opd/teacher_overlap_mass/topk_{k}", teacher_overlap_mass, mask, mode
+                )
+                self._log_masked_mean_metric(f"opd/entropy_gap/topk_{k}", entropy_gap, mask, mode)
 
     def _compute_support_distill_loss(
         self,
@@ -881,6 +945,7 @@ class MiniLLMTrainer(GRPOTrainer):
         mode = "train" if self.model.training else "eval"
         self._log_teacher_mass_metrics(student_logits, teacher_log_probs, mask, mode)
         self._log_teacher_entropy_metrics(student_logits, teacher_log_probs, mask, mode)
+        self._log_opd_alignment_metrics(student_log_probs, teacher_log_probs, mask, mode)
 
         if not self.opd_use_reward_advantage:
             inputs["advantages"] = torch.zeros_like(inputs["advantages"])

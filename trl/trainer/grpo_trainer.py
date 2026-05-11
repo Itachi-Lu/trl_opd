@@ -329,7 +329,9 @@ class GRPOTrainer(_BaseTrainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
-        self.terminal_token_ids = list(dict.fromkeys([self.eos_token_id, self.pad_token_id]))
+        self.terminal_token_ids = list(
+            dict.fromkeys(token_id for token_id in [self.eos_token_id, self.pad_token_id] if token_id is not None)
+        )
         self._terminal_token_id_set = set(self.terminal_token_ids)
 
         if is_peft_available() and is_peft_model(model) and peft_config is not None:
@@ -725,6 +727,14 @@ class GRPOTrainer(_BaseTrainer):
         set_seed(args.seed, device_specific=True)
 
         if self.use_vllm:
+            vllm_generation_kwargs = dict(args.generation_kwargs or {})
+            stop_token_ids = vllm_generation_kwargs.get("stop_token_ids") or []
+            if isinstance(stop_token_ids, int):
+                stop_token_ids = [stop_token_ids]
+            stop_token_ids = list(dict.fromkeys([*stop_token_ids, *self.terminal_token_ids]))
+            if stop_token_ids:
+                vllm_generation_kwargs["stop_token_ids"] = stop_token_ids
+
             # Initialize vLLM generation backend
             self.vllm_generation = VLLMGeneration(
                 model=self.model,
@@ -757,7 +767,7 @@ class GRPOTrainer(_BaseTrainer):
                 min_p=self.min_p,
                 max_completion_length=self.max_completion_length,
                 logprobs=0,  # we only need the generated token logprobs for the importance sampling correction
-                generation_kwargs=args.generation_kwargs,
+                generation_kwargs=vllm_generation_kwargs,
             )
             self._last_loaded_step = -1  # tag to avoid useless loading during grad accumulation
         else:
@@ -766,7 +776,9 @@ class GRPOTrainer(_BaseTrainer):
                 "do_sample": True,
                 "pad_token_id": tokenizer.pad_token_id,
                 "bos_token_id": tokenizer.bos_token_id,
-                "eos_token_id": self.terminal_token_ids if len(self.terminal_token_ids) > 1 else self.eos_token_id,
+                "eos_token_id": self.terminal_token_ids
+                if len(self.terminal_token_ids) > 1
+                else (self.terminal_token_ids[0] if self.terminal_token_ids else self.eos_token_id),
                 "temperature": self.temperature,
                 "top_p": self.top_p,
                 "top_k": self.top_k,
@@ -1165,10 +1177,10 @@ class GRPOTrainer(_BaseTrainer):
     def _is_terminated_completion(self, token_ids: list[int]) -> bool:
         return bool(token_ids) and token_ids[-1] in self._terminal_token_id_set
 
-    def _mask_terminal_pad_tokens(
+    def _mask_terminal_tokens(
         self, completion_ids: torch.Tensor, completion_mask: torch.Tensor
     ) -> torch.Tensor:
-        if self.pad_token_id is None or completion_ids.size(1) == 0:
+        if not self.terminal_token_ids or completion_ids.size(1) == 0:
             return completion_mask
 
         valid_lengths = completion_mask.sum(dim=1)
@@ -1179,8 +1191,11 @@ class GRPOTrainer(_BaseTrainer):
         last_token_positions = valid_lengths[has_tokens] - 1
         row_indices = has_tokens.nonzero(as_tuple=True)[0]
         final_tokens = completion_ids[row_indices, last_token_positions]
+        is_terminal = torch.zeros_like(final_tokens, dtype=torch.bool)
+        for token_id in self.terminal_token_ids:
+            is_terminal |= final_tokens == token_id
         completion_mask[row_indices, last_token_positions] = completion_mask[row_indices, last_token_positions] * (
-            final_tokens != self.pad_token_id
+            ~is_terminal
         ).to(completion_mask.dtype)
         return completion_mask
 
@@ -1804,7 +1819,7 @@ class GRPOTrainer(_BaseTrainer):
         completion_mask = pad(
             completion_mask, padding_value=0, padding_side="right", pad_to_multiple_of=self.pad_to_multiple_of
         ).to(device=device)
-        completion_mask = self._mask_terminal_pad_tokens(completion_ids, completion_mask)
+        completion_mask = self._mask_terminal_tokens(completion_ids, completion_mask)
         if sampling_per_token_logps_list is not None:
             sampling_per_token_logps = [torch.tensor(logps) for logps in sampling_per_token_logps_list]
             sampling_per_token_logps = pad(
@@ -1834,6 +1849,9 @@ class GRPOTrainer(_BaseTrainer):
             # Also mask tool_mask for consistency in multi-turn training
             if tool_mask is not None:
                 tool_mask = tool_mask * (~is_truncated).unsqueeze(1).int()
+
+        loss_mask = completion_mask if tool_mask is None else completion_mask * tool_mask
+        num_items_in_batch = self.accelerator.gather(loss_mask.sum()).sum()
 
         # Concatenate prompt_mask with completion_mask for logit computation
         prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)  # (B, P+C)
@@ -1894,13 +1912,18 @@ class GRPOTrainer(_BaseTrainer):
             # a full optimizer step (when gradient_accumulation_steps is not a multiple of generate_every)—then the
             # samples may come from an earlier version of the model. In that case, we need to track old_per_token_logps
             # for importance sampling. If the steps are aligned, importance sampling isn't necessary and we set
-            # old_per_token_logps to None.
+            # old_per_token_logps to None, unless a subclass objective needs rollout-time logprobs.
             # When using vLLM, we always compute old_per_token_logps for importance sampling, it was shown that the
             # distribution mismatch between vLLM and the training model can be large and harm the training.
             cache_old_student_topk = getattr(self, "reverse_kl_estimator", None) == "old_student_topk_mean"
             generate_every = self.args.steps_per_generation * self.num_iterations  # generation frequency
-            if self.args.gradient_accumulation_steps % generate_every != 0 or (
-                self.use_vllm and self.vllm_importance_sampling_correction
+            requires_rollout_logps = getattr(self, "da_opd_weighting", False) or (
+                getattr(self, "distill_mode", None) == "reverse_kl" and getattr(self, "rkl_advantage", False)
+            )
+            if (
+                requires_rollout_logps
+                or self.args.gradient_accumulation_steps % generate_every != 0
+                or (self.use_vllm and self.vllm_importance_sampling_correction)
             ):
                 old_per_token_logps, _ = self._get_per_token_logps_and_entropies(
                     self.model,
@@ -2513,12 +2536,24 @@ class GRPOTrainer(_BaseTrainer):
         mode = "train" if self.model.training else "eval"
         metrics = {key: sum(val) / len(val) for key, val in self._metrics[mode].items()}  # average the metrics
 
-        # This method can be called both in training and evaluation. When called in evaluation, the keys in `logs`
-        # start with "eval_". We need to add the prefix "eval_" to the keys in `metrics` to match the format.
         if mode == "eval":
-            metrics = {f"eval_{key}": val for key, val in metrics.items()}
+            metric_prefix = "eval"
+            for key in logs:
+                for suffix in ("_loss", "_runtime", "_samples_per_second", "_steps_per_second"):
+                    if key.startswith("eval_") and key.endswith(suffix):
+                        metric_prefix = key[: -len(suffix)]
+                        break
+                if metric_prefix != "eval":
+                    break
 
-        logs = {**logs, **metrics}
+            logs = {}
+            if "reward" in metrics:
+                logs[f"{metric_prefix}_reward"] = metrics["reward"]
+            if "completions/mean_length" in metrics:
+                logs[f"{metric_prefix}_completions/mean_length"] = metrics["completions/mean_length"]
+        else:
+            logs = {**logs, **metrics}
+
         super().log(logs, start_time)
         self._metrics[mode].clear()
 

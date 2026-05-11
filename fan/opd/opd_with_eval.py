@@ -218,21 +218,6 @@ def _ensure_prompt_only_dataset(
     dataset: Dataset, dataset_num_proc: int | None = None, enable_thinking: bool = True
 ) -> Dataset:
     column_names = set(dataset.column_names)
-    if "prompt" in column_names:
-        if enable_thinking:
-            return dataset
-
-        def add_no_think(example):
-            prompt = example["prompt"]
-            if not isinstance(prompt, list):
-                return example
-            if prompt and isinstance(prompt[0], dict) and prompt[0].get("role") == "system":
-                if prompt[0].get("content") == "/no_think":
-                    return example
-                return {"prompt": [{"role": "system", "content": "/no_think"}, *prompt[1:]]}
-            return {"prompt": [{"role": "system", "content": "/no_think"}, *prompt]}
-
-        return dataset.map(add_no_think, num_proc=dataset_num_proc)
 
     def build_prompt(content: str) -> list[dict[str, str]]:
         if enable_thinking:
@@ -241,6 +226,29 @@ def _ensure_prompt_only_dataset(
             {"role": "system", "content": "/no_think"},
             {"role": "user", "content": content},
         ]
+
+    def normalize_prompt(prompt) -> list[dict[str, str]]:
+        if isinstance(prompt, str):
+            return build_prompt(prompt)
+
+        if isinstance(prompt, list):
+            if prompt and isinstance(prompt[0], dict) and "role" not in prompt[0]:
+                return build_prompt(str(prompt[0].get("content", "")))
+            if enable_thinking:
+                return prompt
+            if prompt and isinstance(prompt[0], dict) and prompt[0].get("role") == "system":
+                if prompt[0].get("content") == "/no_think":
+                    return prompt
+                return [{"role": "system", "content": "/no_think"}, *prompt[1:]]
+            return [{"role": "system", "content": "/no_think"}, *prompt]
+
+        return build_prompt(str(prompt))
+
+    if "prompt" in column_names:
+        def normalize_prompt_example(example):
+            return {"prompt": normalize_prompt(example["prompt"])}
+
+        return dataset.map(normalize_prompt_example, num_proc=dataset_num_proc)
 
     if "question" in column_names:
         source_key = "question"
@@ -297,7 +305,27 @@ def _resolve_processing_class_name(model_name_or_path: str) -> str:
     return model_name_or_path
 
 
+def _maybe_wait_for_debugger() -> None:
+    if os.environ.get("DEBUGPY") != "1":
+        return
+
+    rank = os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0"))
+    debug_rank = os.environ.get("DEBUGPY_RANK", "0")
+    if rank != debug_rank:
+        return
+
+    import debugpy
+
+    port = int(os.environ.get("DEBUGPY_PORT", "5678"))
+    debugpy.listen(("0.0.0.0", port))
+    print(f"[debugpy] rank={rank} waiting on port {port}", flush=True)
+    debugpy.wait_for_client()
+    print("[debugpy] client attached", flush=True)
+
+
 if __name__ == "__main__":
+    _maybe_wait_for_debugger()
+
     parser = TrlParser((OPDScriptArguments, MiniLLMConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
 

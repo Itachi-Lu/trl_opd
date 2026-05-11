@@ -16,12 +16,14 @@ import argparse
 import base64
 import logging
 import os
+import time
+import traceback
 from collections.abc import Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from io import BytesIO
 from itertools import chain
-from multiprocessing import Pipe, Process
+from multiprocessing import get_context
 from multiprocessing.connection import Connection
 
 
@@ -310,33 +312,46 @@ class ScriptArguments:
 def llm_worker(
     script_args: ScriptArguments, data_parallel_rank: int, master_port: int, connection: Connection
 ) -> None:
-    from vllm import LLM
-
     # Set required environment variables for DP to work with vLLM
     os.environ["VLLM_DP_RANK"] = str(data_parallel_rank)
     os.environ["VLLM_DP_RANK_LOCAL"] = str(data_parallel_rank)
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
+    os.environ["VLLM_DP_MASTER_IP"] = os.environ.get("VLLM_DP_MASTER_IP") or "127.0.0.1"
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
-    llm = LLM(
-        model=script_args.model,
-        revision=script_args.revision,
-        tensor_parallel_size=script_args.tensor_parallel_size,
-        gpu_memory_utilization=script_args.gpu_memory_utilization,
-        enforce_eager=script_args.enforce_eager,
-        dtype=script_args.dtype,
-        # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
-        # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
-        # This is particularly useful here because we generate completions from the same prompts.
-        enable_prefix_caching=script_args.enable_prefix_caching,
-        kv_cache_dtype=script_args.kv_cache_dtype,
-        max_model_len=script_args.max_model_len,
-        worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
-        trust_remote_code=script_args.trust_remote_code,
-        model_impl=script_args.vllm_model_impl,
-        # Important so temperature scaling/logit tweaking affects the TIS log probs
-        logprobs_mode="processed_logprobs",
-    )
+    try:
+        from vllm import LLM
+
+        llm = LLM(
+            model=script_args.model,
+            revision=script_args.revision,
+            tensor_parallel_size=script_args.tensor_parallel_size,
+            gpu_memory_utilization=script_args.gpu_memory_utilization,
+            enforce_eager=script_args.enforce_eager,
+            dtype=script_args.dtype,
+            # Automatic Prefix Caching caches the KV cache of existing queries, so that a new query can
+            # directly reuse the KV cache if it shares the same prefix with one of the existing queries.
+            # This is particularly useful here because we generate completions from the same prompts.
+            enable_prefix_caching=script_args.enable_prefix_caching,
+            kv_cache_dtype=script_args.kv_cache_dtype,
+            max_model_len=script_args.max_model_len,
+            worker_extension_cls="trl.scripts.vllm_serve.WeightSyncWorkerExtension",
+            trust_remote_code=script_args.trust_remote_code,
+            model_impl=script_args.vllm_model_impl,
+            # Important so temperature scaling/logit tweaking affects the TIS log probs
+            logprobs_mode="processed_logprobs",
+        )
+    except Exception as error:
+        connection.send(
+            {
+                "status": "error",
+                "rank": data_parallel_rank,
+                "error": repr(error),
+                "traceback": traceback.format_exc(),
+            }
+        )
+        connection.close()
+        return
 
     # Send ready signal to parent process
     connection.send({"status": "ready"})
@@ -359,6 +374,10 @@ def llm_worker(
                 connection.send(result)
         elif command["type"] == "shutdown":
             break
+
+
+def is_address_in_use_error(error_messages: Sequence[str]) -> bool:
+    return any("EADDRINUSE" in message or "address already in use" in message.lower() for message in error_messages)
 
 
 def chunk_list(lst: list, n: int) -> list[list]:
@@ -427,36 +446,108 @@ def main(script_args: ScriptArguments):
 
     logger = logging.getLogger(__name__)
 
-    # Spawn dp workers, and setup pipes for communication
-    master_port = get_open_port()
+    mp_context = get_context("spawn")
     connections = []
     processes = []
-    for data_parallel_rank in range(script_args.data_parallel_size):
-        parent_connection, child_connection = Pipe()
-        process = Process(target=llm_worker, args=(script_args, data_parallel_rank, master_port, child_connection))
-        process.start()
-        connections.append(parent_connection)
-        processes.append(process)
+
+    def stop_processes() -> None:
+        for connection in connections:
+            try:
+                connection.close()
+            except OSError:
+                pass
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
+            if process.is_alive():
+                logger.warning(f"Process {process} is still alive after 10 seconds, attempting to kill...")
+                process.kill()
+                process.join()
+
+    def start_processes(master_port: int) -> None:
+        connections.clear()
+        processes.clear()
+        for data_parallel_rank in range(script_args.data_parallel_size):
+            parent_connection, child_connection = mp_context.Pipe()
+            process = mp_context.Process(
+                target=llm_worker, args=(script_args, data_parallel_rank, master_port, child_connection)
+            )
+            process.start()
+            child_connection.close()
+            connections.append(parent_connection)
+            processes.append(process)
+
+    def wait_for_processes_ready(master_port: int) -> None:
+        ready_connections = set()
+        error_messages = []
+        while len(ready_connections) < script_args.data_parallel_size:
+            made_progress = False
+            for connection, process in zip(connections, processes, strict=True):
+                if connection in ready_connections:
+                    continue
+                if connection.poll():
+                    made_progress = True
+                    try:
+                        msg = connection.recv()
+                    except EOFError:
+                        error_messages.append(
+                            f"vLLM worker process exited before sending a startup status. "
+                            f"pid={process.pid}, exitcode={process.exitcode}, master_port={master_port}"
+                        )
+                        continue
+                    if isinstance(msg, dict) and msg.get("status") == "ready":
+                        ready_connections.add(connection)
+                    elif isinstance(msg, dict) and msg.get("status") == "error":
+                        error_messages.append(
+                            f"vLLM worker rank {msg.get('rank')} failed on DP master port {master_port}:\n"
+                            f"{msg.get('traceback') or msg.get('error')}"
+                        )
+                    else:
+                        error_messages.append(
+                            f"vLLM worker sent an unexpected startup status on DP master port {master_port}: {msg!r}"
+                        )
+                elif process.exitcode is not None:
+                    error_messages.append(
+                        f"vLLM worker process exited before startup completed. "
+                        f"pid={process.pid}, exitcode={process.exitcode}, master_port={master_port}"
+                    )
+
+            if error_messages:
+                raise RuntimeError("\n".join(error_messages))
+            if not made_progress:
+                time.sleep(0.1)
+
+    def launch_processes_with_retries() -> None:
+        max_attempts = 5
+        last_error = None
+        for attempt in range(1, max_attempts + 1):
+            master_port = get_open_port()
+            logger.info(f"Starting vLLM DP workers with master port {master_port} (attempt {attempt}/{max_attempts}).")
+            start_processes(master_port)
+            try:
+                wait_for_processes_ready(master_port)
+                return
+            except RuntimeError as error:
+                last_error = error
+                stop_processes()
+                if is_address_in_use_error([str(error)]) and attempt < max_attempts:
+                    logger.warning(
+                        f"vLLM DP master port {master_port} was already in use. Retrying with a new port..."
+                    )
+                    continue
+                raise
+        if last_error is not None:
+            raise last_error
+
+    launch_processes_with_retries()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Wait for all workers to send "ready"
-        ready_connections = set()
-        while len(ready_connections) < script_args.data_parallel_size:
-            for connection in connections:
-                msg = connection.recv()
-                if isinstance(msg, dict) and msg.get("status") == "ready":
-                    ready_connections.add(connection)
-
         yield
 
         # Wait for processes to terminate
-        for process in processes:
-            process.join(timeout=10)  # Wait for 10 seconds for the process to terminate
-            if process.is_alive():
-                logger.warning(f"Process {process} is still alive after 10 seconds, attempting to terminate...")
-                process.terminate()
-                process.join()  # ensure process termination after calling terminate()
+        stop_processes()
 
     app = FastAPI(lifespan=lifespan)
 
