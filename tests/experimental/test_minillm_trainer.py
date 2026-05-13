@@ -105,6 +105,9 @@ class TestMiniLLMTrainer(TrlTestCase):
     def test_da_opd_weights_use_shifted_prefix_drift_and_mask(self):
         trainer = object.__new__(MiniLLMTrainer)
         trainer.da_opd_tau = 2.0
+        trainer.da_opd_normalization = "raw"
+        trainer.da_opd_window_size = 128
+        trainer.da_opd_ema_beta = 0.99
         teacher_logps = torch.tensor([[-1.0, -2.0, -3.0]], dtype=torch.float32)
         student_logps = torch.tensor([[-1.0, -4.0, -1.0]], dtype=torch.float32, requires_grad=True)
         mask = torch.tensor([[True, True, False]])

@@ -251,6 +251,9 @@ class MiniLLMTrainer(GRPOTrainer):
         self.support_loss_teacher_entropy_weighting = args.support_loss_teacher_entropy_weighting
         self.da_opd_weighting = args.da_opd_weighting
         self.da_opd_tau = args.da_opd_tau
+        self.da_opd_normalization = args.da_opd_normalization
+        self.da_opd_window_size = args.da_opd_window_size
+        self.da_opd_ema_beta = args.da_opd_ema_beta
         self.opd_use_reward_advantage = args.opd_use_reward_advantage
         self.use_dual_gate = args.use_dual_gate
         self.use_gate_bonus = args.use_gate_bonus
@@ -378,16 +381,118 @@ class MiniLLMTrainer(GRPOTrainer):
         teacher_token_logprobs: torch.Tensor,
         student_token_logprobs: torch.Tensor,
         mask: torch.Tensor,
+        student_log_probs: torch.Tensor | None = None,
+        teacher_log_probs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dispatch to a normalization-specific score function and convert to per-token weight.
+
+        See `note/da_opd_theoretical_review.md` for the rationale of each option.
+
+        Returns:
+            weights: (B, T) detached weights, already masked.
+            rho:     (B, T) raw cumulative log-prob ratio (always computed for monitoring).
+        """
         mask_float = mask.float()
         logprob_ratio = (teacher_token_logprobs - student_token_logprobs) * mask_float
         rho = logprob_ratio.cumsum(dim=-1)
-        rho_prefix = torch.cat([torch.zeros_like(rho[:, :1]), rho[:, :-1]], dim=-1)
-        weights = torch.sigmoid(rho_prefix / self.da_opd_tau).detach() * mask_float
+
+        norm = self.da_opd_normalization
+        if norm == "raw":
+            score = self._da_opd_score_raw(rho)
+        elif norm == "seq":
+            score = self._da_opd_score_seq(logprob_ratio, rho, mask_float)
+        elif norm == "window_avg":
+            score = self._da_opd_score_window_avg(rho, mask_float, self.da_opd_window_size)
+        elif norm == "ema_kl":
+            if student_log_probs is None or teacher_log_probs is None:
+                raise RuntimeError(
+                    "da_opd_normalization='ema_kl' requires student_log_probs and teacher_log_probs."
+                )
+            score = self._da_opd_score_ema_kl(student_log_probs, teacher_log_probs, mask_float, self.da_opd_ema_beta)
+        elif norm == "inverse_length":
+            score = self._da_opd_score_inverse_length(rho, mask_float)
+        else:
+            raise ValueError(f"Unsupported da_opd_normalization={norm!r}")
+
+        weights = torch.sigmoid(score / self.da_opd_tau).detach() * mask_float
         return weights, rho
+
+    @staticmethod
+    def _da_opd_score_raw(rho: torch.Tensor) -> torch.Tensor:
+        """Paper default: rho_prefix (cumulative log-prob ratio shifted by 1)."""
+        return torch.cat([torch.zeros_like(rho[:, :1]), rho[:, :-1]], dim=-1)
+
+    @staticmethod
+    def _da_opd_score_seq(
+        logprob_ratio: torch.Tensor, rho: torch.Tensor, mask_float: torch.Tensor
+    ) -> torch.Tensor:
+        """Narrative A: sequence-level scalar IS, per-token avg ratio broadcast across T."""
+        rho_T = logprob_ratio.sum(dim=-1, keepdim=True)
+        T_valid = mask_float.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        per_token_avg = rho_T / T_valid
+        return per_token_avg.expand_as(rho)
+
+    @staticmethod
+    def _da_opd_score_window_avg(rho: torch.Tensor, mask_float: torch.Tensor, window: int) -> torch.Tensor:
+        """Narrative B: average per-token log-prob ratio over a backward window of size `window`."""
+        rho_prefix = torch.cat([torch.zeros_like(rho[:, :1]), rho[:, :-1]], dim=-1)
+        # rho_shifted[t] = rho_prefix[t - window] (clamped to 0 for t < window)
+        rho_shifted = torch.cat(
+            [torch.zeros_like(rho_prefix[:, :window]), rho_prefix[:, :-window]], dim=-1
+        )
+        win_sum = rho_prefix - rho_shifted
+
+        # Effective window length (number of valid prefix tokens within the last `window` positions)
+        valid_prefix = torch.cat(
+            [torch.zeros_like(mask_float[:, :1]), mask_float[:, :-1]], dim=-1
+        ).cumsum(dim=-1)
+        valid_shifted = torch.cat(
+            [torch.zeros_like(valid_prefix[:, :window]), valid_prefix[:, :-window]], dim=-1
+        )
+        win_len = (valid_prefix - valid_shifted).clamp_min(1.0)
+        return win_sum / win_len
+
+    @staticmethod
+    def _da_opd_score_inverse_length(rho: torch.Tensor, mask_float: torch.Tensor) -> torch.Tensor:
+        """Narrative C: reverse direction. -rho_avg so that high cumulative drift -> high weight."""
+        rho_prefix = torch.cat([torch.zeros_like(rho[:, :1]), rho[:, :-1]], dim=-1)
+        valid_prefix = torch.cat(
+            [torch.zeros_like(mask_float[:, :1]), mask_float[:, :-1]], dim=-1
+        ).cumsum(dim=-1).clamp_min(1.0)
+        return -(rho_prefix / valid_prefix)
+
+    @staticmethod
+    def _da_opd_score_ema_kl(
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        mask_float: torch.Tensor,
+        beta: float,
+    ) -> torch.Tensor:
+        """Narrative B (alt): EMA of per-step full-distribution reverse KL.
+
+        score_t = -EMA_{t-1}(KL(pi_theta || pi_te)).  Larger KL -> smaller sigmoid weight.
+        Uses sequential scan; for T=18432 this is sub-second on GPU.
+        """
+        # Per-step KL(pi_theta || pi_te) using full vocab distributions.
+        student_probs = student_log_probs.exp()
+        kl_per_token = (student_probs * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        kl_per_token = kl_per_token * mask_float
+
+        B, T = kl_per_token.shape
+        ema = torch.zeros((B, T), dtype=kl_per_token.dtype, device=kl_per_token.device)
+        prev = torch.zeros(B, dtype=kl_per_token.dtype, device=kl_per_token.device)
+        one_minus = 1.0 - beta
+        for t in range(T):
+            prev = beta * prev + one_minus * kl_per_token[:, t]
+            ema[:, t] = prev
+
+        # Shift right so that score at position t uses EMA up to t-1 (causal).
+        ema_prefix = torch.cat([torch.zeros_like(ema[:, :1]), ema[:, :-1]], dim=-1)
+        return -ema_prefix
 
     def _log_da_opd_metrics(self, rho: torch.Tensor, weights: torch.Tensor, mask: torch.Tensor, mode: str) -> None:
         valid_mask = mask.bool()
+        mask_float = mask.float()
         rho_valid = rho.detach().float()[valid_mask]
         weight_valid = weights.detach().float()[valid_mask]
 
@@ -419,6 +524,50 @@ class MiniLLMTrainer(GRPOTrainer):
         self._metrics[mode]["da_opd/weight_mean"].append(weight_mean.item())
         self._metrics[mode]["da_opd/weight_min"].append(weight_min.item())
         self._metrics[mode]["da_opd/weight_max"].append(weight_max.item())
+
+        # ---- New diagnostics introduced by da_opd_theoretical_review.md ----
+        # Per-sample sums / max for effective_tokens / effective_fraction.
+        weights_masked = weights.detach().float() * mask_float
+        per_sample_weight_sum = weights_masked.sum(dim=-1)
+        per_sample_weight_max = weights_masked.max(dim=-1).values.clamp_min(1e-8)
+        per_sample_valid_count = mask_float.sum(dim=-1).clamp_min(1.0)
+
+        effective_tokens = per_sample_weight_sum / per_sample_weight_max
+        effective_fraction = per_sample_weight_sum / per_sample_valid_count
+
+        # Saturation rates only over valid tokens.
+        valid_count = mask_float.sum().clamp_min(1.0)
+        sat_low = ((weights_masked < 1e-6) & valid_mask).float().sum() / valid_count
+        sat_high = ((weights_masked > 0.99) & valid_mask).float().sum() / valid_count
+
+        # Position-binned weight means (4 segments along the tensor T axis).
+        T = weights.size(-1)
+        seg_size = max(1, T // 4)
+
+        def seg_mean(start: int, end: int) -> torch.Tensor:
+            w_seg = weights_masked[:, start:end]
+            m_seg = mask_float[:, start:end]
+            return w_seg.sum() / m_seg.sum().clamp_min(1.0)
+
+        seg0 = seg_mean(0, seg_size)
+        seg1 = seg_mean(seg_size, 2 * seg_size)
+        seg2 = seg_mean(2 * seg_size, 3 * seg_size)
+        seg3 = seg_mean(3 * seg_size, T)
+
+        # All scalar tensors; gather then nanmean for cross-rank aggregation.
+        def gather_scalar(value: torch.Tensor) -> float:
+            value = value.detach().to(self.accelerator.device)
+            gathered = self.accelerator.gather(value.reshape(1))
+            return gathered.float().nanmean().item()
+
+        self._metrics[mode]["da_opd/effective_tokens"].append(gather_scalar(effective_tokens.mean()))
+        self._metrics[mode]["da_opd/effective_fraction"].append(gather_scalar(effective_fraction.mean()))
+        self._metrics[mode]["da_opd/saturation_rate_low"].append(gather_scalar(sat_low))
+        self._metrics[mode]["da_opd/saturation_rate_high"].append(gather_scalar(sat_high))
+        self._metrics[mode]["da_opd/weight_seg0_mean"].append(gather_scalar(seg0))
+        self._metrics[mode]["da_opd/weight_seg1_mean"].append(gather_scalar(seg1))
+        self._metrics[mode]["da_opd/weight_seg2_mean"].append(gather_scalar(seg2))
+        self._metrics[mode]["da_opd/weight_seg3_mean"].append(gather_scalar(seg3))
 
     def _build_student_topp_support(
         self, student_logits: torch.Tensor, top_p: float, min_k: int
@@ -961,6 +1110,8 @@ class MiniLLMTrainer(GRPOTrainer):
                 teacher_token_logprobs=teacher_log_probs_on_labels,
                 student_token_logprobs=rollout_log_probs_on_labels,
                 mask=mask,
+                student_log_probs=student_log_probs,
+                teacher_log_probs=teacher_log_probs,
             )
             self._log_da_opd_metrics(da_opd_rho, da_opd_token_weights, mask, mode)
 

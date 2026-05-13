@@ -164,6 +164,25 @@ class MiniLLMConfig(GRPOConfig):
         default=2.0,
         metadata={"help": "Temperature used to map prefix log-probability drift to DA-OPD token weights."},
     )
+    da_opd_normalization: str = field(
+        default="raw",
+        metadata={
+            "help": "DA-OPD weighting scheme. One of: 'raw' (paper default cumulative rho), "
+            "'seq' (Narrative A: sequence-level scalar IS), 'window_avg' (Narrative B: window-mean ratio), "
+            "'ema_kl' (Narrative B alt: EMA over per-step full-distribution KL), "
+            "'inverse_length' (Narrative C: reverse direction sanity check)."
+        },
+    )
+    da_opd_window_size: int = field(
+        default=128,
+        metadata={"help": "Window size when da_opd_normalization='window_avg'."},
+    )
+    da_opd_ema_beta: float = field(
+        default=0.99,
+        metadata={
+            "help": "EMA decay coefficient when da_opd_normalization='ema_kl'. Half-life is roughly 1/(1-beta)."
+        },
+    )
     opd_use_reward_advantage: bool = field(
         default=False,
         metadata={
@@ -248,6 +267,16 @@ class MiniLLMConfig(GRPOConfig):
             )
         if self.da_opd_tau <= 0.0:
             raise ValueError(f"da_opd_tau must be > 0, but got {self.da_opd_tau}.")
+        valid_da_opd_norms = {"raw", "seq", "window_avg", "ema_kl", "inverse_length"}
+        if self.da_opd_normalization not in valid_da_opd_norms:
+            raise ValueError(
+                f"da_opd_normalization must be one of {sorted(valid_da_opd_norms)}, "
+                f"but got {self.da_opd_normalization!r}."
+            )
+        if self.da_opd_window_size < 1:
+            raise ValueError(f"da_opd_window_size must be >= 1, but got {self.da_opd_window_size}.")
+        if not (0.0 < self.da_opd_ema_beta < 1.0):
+            raise ValueError(f"da_opd_ema_beta must be in (0, 1), but got {self.da_opd_ema_beta}.")
 
         num_processes = self.world_size
         # The current default effective batch size
