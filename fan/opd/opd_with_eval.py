@@ -36,7 +36,7 @@ EVAL_DATASETS = {
 
 
 def _load_parquet_eval_dataset(
-    parquet_path: Path, enable_thinking: bool = False
+    parquet_path: Path, enable_thinking: bool = False, qwen3_no_think: bool = False
 ) -> Dataset:
     df = pd.read_parquet(parquet_path)
     records = []
@@ -53,7 +53,7 @@ def _load_parquet_eval_dataset(
         else:
             solution = str(reward_model).strip()
 
-        if enable_thinking:
+        if enable_thinking or not qwen3_no_think:
             prompt = [{"role": "user", "content": problem_text}]
         else:
             prompt = [
@@ -70,6 +70,7 @@ def load_eval_datasets(
     data_dir: Path | None = None,
     dataset_names: list[str] | None = None,
     enable_thinking: bool = False,
+    qwen3_no_think: bool = False,
 ) -> dict[str, Dataset]:
     if data_dir is None:
         data_dir = EVAL_SUITE_DATA_DIR
@@ -86,7 +87,7 @@ def load_eval_datasets(
         parquet_path = data_dir / rel_path
         if not parquet_path.exists():
             raise FileNotFoundError(f"Eval parquet not found: {parquet_path}")
-        result[name] = _load_parquet_eval_dataset(parquet_path, enable_thinking)
+        result[name] = _load_parquet_eval_dataset(parquet_path, enable_thinking, qwen3_no_think)
         print(f"  Loaded eval dataset {name!r}: {len(result[name])} samples from {parquet_path}")
 
     return result
@@ -215,12 +216,15 @@ class OPDScriptArguments:
 
 
 def _ensure_prompt_only_dataset(
-    dataset: Dataset, dataset_num_proc: int | None = None, enable_thinking: bool = True
+    dataset: Dataset,
+    dataset_num_proc: int | None = None,
+    enable_thinking: bool = True,
+    qwen3_no_think: bool = False,
 ) -> Dataset:
     column_names = set(dataset.column_names)
 
     def build_prompt(content: str) -> list[dict[str, str]]:
-        if enable_thinking:
+        if enable_thinking or not qwen3_no_think:
             return [{"role": "user", "content": content}]
         return [
             {"role": "system", "content": "/no_think"},
@@ -234,7 +238,7 @@ def _ensure_prompt_only_dataset(
         if isinstance(prompt, list):
             if prompt and isinstance(prompt[0], dict) and "role" not in prompt[0]:
                 return build_prompt(str(prompt[0].get("content", "")))
-            if enable_thinking:
+            if enable_thinking or not qwen3_no_think:
                 return prompt
             if prompt and isinstance(prompt[0], dict) and prompt[0].get("role") == "system":
                 if prompt[0].get("content") == "/no_think":
@@ -266,7 +270,9 @@ def _ensure_prompt_only_dataset(
     return dataset.map(make_prompt, num_proc=dataset_num_proc)
 
 
-def _load_dataset_splits(script_args: OPDScriptArguments) -> tuple[Dataset, Dataset | None]:
+def _load_dataset_splits(
+    script_args: OPDScriptArguments, qwen3_no_think: bool = False
+) -> tuple[Dataset, Dataset | None]:
     split_names: list[str] = [script_args.dataset_train_split]
     load_eval = script_args.dataset_eval_split is not None and script_args.dataset_eval_split.lower() != "none"
     if load_eval:
@@ -284,11 +290,11 @@ def _load_dataset_splits(script_args: OPDScriptArguments) -> tuple[Dataset, Data
         eval_dataset = None
 
     train_dataset = _ensure_prompt_only_dataset(
-        train_dataset, script_args.dataset_num_proc, script_args.enable_thinking
+        train_dataset, script_args.dataset_num_proc, script_args.enable_thinking, qwen3_no_think
     )
     if eval_dataset is not None:
         eval_dataset = _ensure_prompt_only_dataset(
-            eval_dataset, script_args.dataset_num_proc, script_args.enable_thinking
+            eval_dataset, script_args.dataset_num_proc, script_args.enable_thinking, qwen3_no_think
         )
     return train_dataset, eval_dataset
 
@@ -303,6 +309,20 @@ def _resolve_processing_class_name(model_name_or_path: str) -> str:
     if model_name_or_path.startswith("Qwen/Qwen3-") and model_name_or_path.endswith("-Base"):
         return model_name_or_path[: -len("-Base")]
     return model_name_or_path
+
+
+def _is_qwen3_model_name(name: str | None) -> bool:
+    return bool(name) and ("Qwen3-" in name or "/Qwen3" in name)
+
+
+def _use_qwen3_no_think(script_args: OPDScriptArguments, model_name_or_path: str) -> bool:
+    return (
+        not script_args.enable_thinking
+        and (
+            _is_qwen3_model_name(model_name_or_path)
+            or _is_qwen3_model_name(script_args.tokenizer_name_or_path)
+        )
+    )
 
 
 def _maybe_wait_for_debugger() -> None:
@@ -328,6 +348,7 @@ if __name__ == "__main__":
 
     parser = TrlParser((OPDScriptArguments, MiniLLMConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    qwen3_no_think = _use_qwen3_no_think(script_args, model_args.model_name_or_path)
 
     os.environ.setdefault("WANDB_PROJECT", script_args.wandb_project)
 
@@ -383,7 +404,7 @@ if __name__ == "__main__":
     if training_args.max_completion_length is None:
         training_args.max_completion_length = 4096
 
-    if not script_args.enable_thinking:
+    if qwen3_no_think:
         chat_template_kwargs = dict(training_args.chat_template_kwargs or {})
         chat_template_kwargs.setdefault("enable_thinking", False)
         training_args.chat_template_kwargs = chat_template_kwargs
@@ -398,7 +419,7 @@ if __name__ == "__main__":
     training_args.temperature = 1.0
 
     # --- Load training data ---
-    train_dataset, _ = _load_dataset_splits(script_args)
+    train_dataset, _ = _load_dataset_splits(script_args, qwen3_no_think)
 
     # --- Load eval data from parquet ---
     eval_data_dir = Path(script_args.eval_data_dir) if script_args.eval_data_dir else None
@@ -408,6 +429,7 @@ if __name__ == "__main__":
         data_dir=eval_data_dir,
         dataset_names=eval_dataset_names,
         enable_thinking=script_args.enable_thinking,
+        qwen3_no_think=qwen3_no_think,
     )
     total_eval = sum(len(ds) for ds in eval_datasets.values())
     print(f"Loaded {len(eval_datasets)} eval datasets, {total_eval} samples total")
@@ -440,7 +462,7 @@ if __name__ == "__main__":
         processing_class=processing_class,
         peft_config=get_peft_config(model_args),
     )
-    if not script_args.enable_thinking:
+    if qwen3_no_think:
         trainer.chat_template = qwen3_training_chat_template
     _attach_token_debug_dump(trainer, training_args.output_dir)
 

@@ -95,6 +95,9 @@ class GRPOConfig(_BaseConfig):
             `SamplingParams` (if using vLLM) when sampling completions. This can be used to further customize the
             generation behavior, such as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that conflict
             with the other generation parameters (like `min_p`, `top_p`, etc.), they will override them.
+        mask_terminal_tokens (`bool`, *optional*, defaults to `True`):
+            Whether to remove the final terminal token (EOS/PAD/stop token) from the completion loss mask after
+            generation. Set to `False` to keep terminal tokens in the loss mask.
         chat_template_kwargs (`dict[str, Any]`, *optional*):
             Additional keyword arguments to pass to the `apply_chat_template` function when generating completions.
         repetition_penalty (`float`, *optional*, defaults to `1.0`):
@@ -461,6 +464,12 @@ class GRPOConfig(_BaseConfig):
             "`SamplingParams` (if using vLLM) when sampling completions. This can be used to further customize the "
             "generation behavior, such as setting `suppress_tokens`, `num_beams`, etc. If it contains keys that "
             "conflict with the other generation parameters (like `min_p`, `top_p`, etc.), they will override them."
+        },
+    )
+    mask_terminal_tokens: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to remove the final terminal token (EOS/PAD/stop token) from the completion loss mask."
         },
     )
     chat_template_kwargs: dict | None = field(

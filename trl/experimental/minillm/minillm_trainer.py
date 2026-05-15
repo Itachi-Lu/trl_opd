@@ -265,6 +265,25 @@ class MiniLLMTrainer(GRPOTrainer):
         self.gate_bonus_min = args.gate_bonus_min
         self.gate_bonus_max = args.gate_bonus_max
 
+    def _align_logits_to_shared_model_vocab(
+        self,
+        student_logits: torch.Tensor,
+        teacher_logits: torch.Tensor,
+        labels: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        student_vocab_size = student_logits.size(-1)
+        teacher_vocab_size = teacher_logits.size(-1)
+        shared_vocab_size = min(student_vocab_size, teacher_vocab_size)
+        if labels is not None and labels.numel() > 0:
+            max_label = int(labels.max().item())
+            if max_label >= shared_vocab_size:
+                raise RuntimeError(
+                    "Found token id outside shared model vocab before distillation gather: "
+                    f"max_token_id={max_label}, student_logits_vocab_size={student_vocab_size}, "
+                    f"teacher_logits_vocab_size={teacher_vocab_size}, shared_vocab_size={shared_vocab_size}."
+                )
+        return student_logits[..., :shared_vocab_size], teacher_logits[..., :shared_vocab_size]
+
     def _single_step_decomposition_loss(
         self,
         student_log_probs: torch.Tensor,
@@ -595,14 +614,10 @@ class MiniLLMTrainer(GRPOTrainer):
     def _exclude_stop_tokens_from_support(
         self, support_indices: torch.Tensor, local_support_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.distill_mode != "student_topp_reverse_kl":
+        if self.distill_mode != "student_topp_reverse_kl" or not getattr(self, "mask_terminal_tokens", True):
             return support_indices, local_support_mask
 
-        excluded_token_ids = []
-        if getattr(self, "pad_token_id", None) is not None:
-            excluded_token_ids.append(self.pad_token_id)
-        if getattr(self, "eos_token_id", None) is not None:
-            excluded_token_ids.append(self.eos_token_id)
+        excluded_token_ids = list(getattr(self, "terminal_token_ids", []) or [])
         if not excluded_token_ids:
             return support_indices, local_support_mask
 
@@ -1078,6 +1093,9 @@ class MiniLLMTrainer(GRPOTrainer):
         # Apply temperature scaling
         student_logits = student_logits / self.kd_temperature
         teacher_logits = teacher_logits / self.kd_temperature
+        student_logits, teacher_logits = self._align_logits_to_shared_model_vocab(
+            student_logits, teacher_logits, labels=shifted_labels
+        )
 
         # Compute log probabilities for student and probabilities for teacher
         student_log_probs = F.log_softmax(student_logits, dim=-1)

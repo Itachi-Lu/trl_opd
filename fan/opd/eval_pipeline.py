@@ -16,6 +16,7 @@ from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, TimeoutError
 
 import pandas as pd
+from transformers import AutoTokenizer, GenerationConfig
 
 EVAL_SUITE_ROOT = Path(
     "/apdcephfs_qy4/share_302593112/shaofanliu/projects/lzh"
@@ -43,7 +44,7 @@ _DP_WORKER_SAMPLING_PARAMS = None
 _DP_WORKER_SAMPLING_KEY = None
 _DP_WORKER_GPU_ID = None
 
-DEFAULT_STOP_TOKEN_IDS = [151643, 151645]
+QWEN3_STOP_TOKEN_IDS = [151643, 151645]
 
 
 def load_samples(parquet_path: Path) -> list[dict]:
@@ -75,6 +76,7 @@ def generate_completions(
     model_path: str,
     tokenizer_path: str | None,
     max_tokens: int,
+    qwen3_no_think: bool,
 ) -> list[dict]:
     """Generate k completions per sample using vLLM. Returns flat list of records."""
     if dp_executors:
@@ -86,9 +88,10 @@ def generate_completions(
             sampling_params=sampling_params,
             samples=samples,
             enable_thinking=enable_thinking,
+            qwen3_no_think=qwen3_no_think,
         )
 
-    if enable_thinking:
+    if enable_thinking or not qwen3_no_think:
         messages_batch = [
             [{"role": "user", "content": s["prompt"]}]
             for s in samples
@@ -131,8 +134,10 @@ def _sampling_params_to_dict(sampling_params) -> dict:
         "temperature": float(sampling_params.temperature),
         "top_p": float(sampling_params.top_p),
         "max_tokens": int(sampling_params.max_tokens),
-        "stop_token_ids": list(getattr(sampling_params, "stop_token_ids", DEFAULT_STOP_TOKEN_IDS)),
     }
+    stop_token_ids = getattr(sampling_params, "stop_token_ids", None)
+    if stop_token_ids:
+        sampling_cfg["stop_token_ids"] = list(stop_token_ids)
     seed = getattr(sampling_params, "seed", None)
     if seed is not None:
         sampling_cfg["seed"] = int(seed)
@@ -146,6 +151,7 @@ def _dp_worker_generate(
     sampling_cfg: dict,
     samples: list[dict],
     enable_thinking: bool,
+    qwen3_no_think: bool = False,
 ) -> list[dict]:
     global _DP_WORKER_LLM
     global _DP_WORKER_LLM_KEY
@@ -175,7 +181,7 @@ def _dp_worker_generate(
         _DP_WORKER_SAMPLING_PARAMS = SamplingParams(**sampling_cfg)
         _DP_WORKER_SAMPLING_KEY = sampling_key
 
-    if enable_thinking:
+    if enable_thinking or not qwen3_no_think:
         messages_batch = [[{"role": "user", "content": s["prompt"]}] for s in samples]
     else:
         messages_batch = [
@@ -222,6 +228,8 @@ def _dp_worker_warmup(
     tokenizer_path: str | None,
     max_tokens: int,
     sampling_cfg: dict,
+    enable_thinking: bool,
+    qwen3_no_think: bool,
 ) -> str:
     warmup_sampling_cfg = dict(sampling_cfg)
     warmup_sampling_cfg["n"] = 1
@@ -234,7 +242,8 @@ def _dp_worker_warmup(
         max_tokens=max_tokens,
         sampling_cfg=warmup_sampling_cfg,
         samples=[{"example_id": -1, "prompt": "1+1=?", "answer": "2"}],
-        enable_thinking=False,
+        enable_thinking=enable_thinking,
+        qwen3_no_think=qwen3_no_think,
     )
     return "ok"
 
@@ -350,6 +359,7 @@ def _generate_completions_dp(
     sampling_params,
     samples: list[dict],
     enable_thinking: bool,
+    qwen3_no_think: bool,
 ) -> list[dict]:
     sampling_cfg = _sampling_params_to_dict(sampling_params)
     shards = _split_samples(samples, len(dp_executors))
@@ -368,6 +378,7 @@ def _generate_completions_dp(
             sampling_cfg,
             shard,
             enable_thinking,
+            qwen3_no_think,
         ))
 
     records = []
@@ -552,6 +563,38 @@ def maybe_build_tokenizer_patch_dir(model_path: Path, output_dir: Path) -> str |
     return str(patch_dir)
 
 
+def _append_token_ids(target: list[int], token_id) -> None:
+    if token_id is None:
+        return
+    token_ids = token_id if isinstance(token_id, list) else [token_id]
+    for item in token_ids:
+        if item is not None and item not in target:
+            target.append(int(item))
+
+
+def infer_stop_token_ids(model_path: Path, tokenizer_path: str | None, qwen3: bool) -> list[int] | None:
+    if qwen3:
+        return list(QWEN3_STOP_TOKEN_IDS)
+
+    source = tokenizer_path or str(model_path)
+    stop_token_ids: list[int] = []
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(source, trust_remote_code=True)
+        _append_token_ids(stop_token_ids, tokenizer.eos_token_id)
+        _append_token_ids(stop_token_ids, tokenizer.pad_token_id)
+    except Exception as exc:
+        print(f"WARNING: failed to infer stop ids from tokenizer {source!r}: {exc}")
+
+    try:
+        generation_config = GenerationConfig.from_pretrained(str(model_path), trust_remote_code=True)
+        _append_token_ids(stop_token_ids, getattr(generation_config, "eos_token_id", None))
+        _append_token_ids(stop_token_ids, getattr(generation_config, "pad_token_id", None))
+    except Exception:
+        pass
+
+    return stop_token_ids or None
+
+
 def build_llm_and_sampling_params(
     model_path: Path,
     tokenizer_path: str | None,
@@ -561,6 +604,7 @@ def build_llm_and_sampling_params(
     top_p: float,
     max_tokens: int,
     sampling_seed: int,
+    stop_token_ids: list[int] | None,
 ):
     from vllm import LLM, SamplingParams
 
@@ -572,14 +616,16 @@ def build_llm_and_sampling_params(
         dtype="bfloat16",
         max_model_len=max_tokens + 512,
     )
-    sampling_params = SamplingParams(
-        n=k,
-        temperature=temperature,
-        top_p=top_p,
-        max_tokens=max_tokens,
-        stop_token_ids=DEFAULT_STOP_TOKEN_IDS,
-        seed=sampling_seed,
-    )
+    sampling_kwargs = {
+        "n": k,
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "seed": sampling_seed,
+    }
+    if stop_token_ids:
+        sampling_kwargs["stop_token_ids"] = stop_token_ids
+    sampling_params = SamplingParams(**sampling_kwargs)
     return llm, sampling_params
 
 
@@ -609,7 +655,9 @@ def main():
                         help="Number of data-parallel vLLM workers (each worker loads a full model, TP=1).")
     parser.add_argument("--math_equal_timeout", type=float, default=30.0)
     parser.add_argument("--sampling_seed", type=int, default=42)
-    parser.add_argument("--enable_thinking", action="store_true", default=False)
+    parser.add_argument("--enable_thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--qwen3", action="store_true", default=False,
+                        help="Use legacy Qwen3 eval behavior, including hard-coded Qwen3 stop token ids.")
     parser.add_argument("--wandb_project", type=str, default="opd_distill_with_eval")
     parser.add_argument("--wandb_name", type=str, default=None, help="wandb run name. Defaults to model dir name.")
     parser.add_argument("--no_wandb", action="store_true", default=False)
@@ -629,6 +677,9 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else model_path / "eval_results"
     output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer_path = maybe_build_tokenizer_patch_dir(model_path, output_dir)
+    qwen3_no_think = args.qwen3 and not args.enable_thinking
+    stop_token_ids = infer_stop_token_ids(model_path, tokenizer_path, args.qwen3)
+    print(f"Stop token ids: {stop_token_ids if stop_token_ids is not None else 'vLLM/model default'}")
     llm = None
     sampling_params = None
     dp_executors = None
@@ -639,14 +690,16 @@ def main():
         dp_workers = min(args.data_parallel_size, len(visible_gpu_ids))
         dp_gpu_ids = visible_gpu_ids[:dp_workers]
         from vllm import SamplingParams
-        sampling_params = SamplingParams(
-            n=args.k,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            max_tokens=args.max_tokens,
-            stop_token_ids=DEFAULT_STOP_TOKEN_IDS,
-            seed=args.sampling_seed,
-        )
+        sampling_kwargs = {
+            "n": args.k,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "max_tokens": args.max_tokens,
+            "seed": args.sampling_seed,
+        }
+        if stop_token_ids:
+            sampling_kwargs["stop_token_ids"] = stop_token_ids
+        sampling_params = SamplingParams(**sampling_kwargs)
         sampling_cfg = _sampling_params_to_dict(sampling_params)
 
         dp_executors = []
@@ -669,6 +722,8 @@ def main():
                 tokenizer_path,
                 args.max_tokens,
                 sampling_cfg,
+                args.enable_thinking,
+                qwen3_no_think,
             )
             future.result()
             print(f"DP worker on GPU {gpu_id} is ready.")
@@ -684,6 +739,7 @@ def main():
             top_p=args.top_p,
             max_tokens=args.max_tokens,
             sampling_seed=args.sampling_seed,
+            stop_token_ids=stop_token_ids,
         )
 
     dataset_names = [n.strip() for n in args.datasets.split(",") if n.strip()]
@@ -724,6 +780,7 @@ def main():
             model_path=str(model_path),
             tokenizer_path=tokenizer_path,
             max_tokens=args.max_tokens,
+            qwen3_no_think=qwen3_no_think,
         )
         print(
             f"  [1/3] Generation finished: {len(records)} completions "

@@ -30,6 +30,7 @@ from opd_with_eval import (
     _maybe_wait_for_debugger,
     _resolve_dtype,
     _resolve_processing_class_name,
+    _use_qwen3_no_think,
     accuracy_reward_with_fallback,
 )
 
@@ -235,6 +236,9 @@ def _compute_metric_tensors(
 
     student_logits = student_outputs.logits[:, prompt_lengths - 1 : -1, :] / trainer.kd_temperature
     teacher_logits = teacher_outputs.logits[:, prompt_lengths - 1 : -1, :] / trainer.kd_temperature
+    student_logits, teacher_logits = trainer._align_logits_to_shared_model_vocab(
+        student_logits, teacher_logits, labels=shifted_labels
+    )
     student_log_probs = F.log_softmax(student_logits, dim=-1)
     teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)
 
@@ -740,7 +744,11 @@ def _write_samples_index(output_dir: Path) -> None:
     (samples_root / "index.html").write_text(index_html, encoding="utf-8")
 
 
-def _prepare_training_args(script_args: OPDMetricsScriptArguments, training_args: MiniLLMConfig) -> None:
+def _prepare_training_args(
+    script_args: OPDMetricsScriptArguments,
+    training_args: MiniLLMConfig,
+    qwen3_no_think: bool = False,
+) -> None:
     world_size = max(training_args.world_size, 1)
     total_rollouts_per_batch = script_args.groups_per_batch * script_args.group_size
     if script_args.metrics_num_rollouts <= 0:
@@ -784,7 +792,7 @@ def _prepare_training_args(script_args: OPDMetricsScriptArguments, training_args
     if training_args.max_completion_length is None:
         training_args.max_completion_length = 4096
 
-    if not script_args.enable_thinking:
+    if qwen3_no_think:
         chat_template_kwargs = dict(training_args.chat_template_kwargs or {})
         chat_template_kwargs.setdefault("enable_thinking", False)
         training_args.chat_template_kwargs = chat_template_kwargs
@@ -808,7 +816,8 @@ def main() -> None:
 
     parser = TrlParser((OPDMetricsScriptArguments, MiniLLMConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
-    _prepare_training_args(script_args, training_args)
+    qwen3_no_think = _use_qwen3_no_think(script_args, model_args.model_name_or_path)
+    _prepare_training_args(script_args, training_args, qwen3_no_think)
 
     dtype = _resolve_dtype(model_args.dtype)
     training_args.model_init_kwargs = dict(
@@ -829,7 +838,7 @@ def main() -> None:
         training_args.model_init_kwargs["device_map"] = get_kbit_device_map()
         training_args.model_init_kwargs["quantization_config"] = quantization_config
 
-    train_dataset, _ = _load_dataset_splits(script_args)
+    train_dataset, _ = _load_dataset_splits(script_args, qwen3_no_think)
     if len(train_dataset) == 0:
         raise ValueError("Training dataset is empty; cannot generate metric rollouts.")
 
@@ -872,7 +881,7 @@ def main() -> None:
         processing_class=processing_class,
         peft_config=get_peft_config(model_args),
     )
-    if not script_args.enable_thinking:
+    if qwen3_no_think:
         trainer.chat_template = qwen3_training_chat_template
     if getattr(trainer, "use_vllm", False):
         trainer._last_loaded_step = trainer.state.global_step

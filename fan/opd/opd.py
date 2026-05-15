@@ -115,7 +115,7 @@ class OPDScriptArguments:
     enable_thinking: bool = field(
         default=True,
         metadata={
-            "help": "Whether prompts should allow thinking mode. If false, a `/no_think` system message is prepended."
+            "help": "Whether prompts should allow thinking mode. For Qwen3 compatibility, false prepends `/no_think`."
         },
     )
     tinker_single_update: bool = field(
@@ -128,11 +128,14 @@ class OPDScriptArguments:
 
 
 def _ensure_prompt_only_dataset(
-    dataset: Dataset, dataset_num_proc: int | None = None, enable_thinking: bool = True
+    dataset: Dataset,
+    dataset_num_proc: int | None = None,
+    enable_thinking: bool = True,
+    qwen3_no_think: bool = False,
 ) -> Dataset:
     column_names = set(dataset.column_names)
     if "prompt" in column_names:
-        if enable_thinking:
+        if enable_thinking or not qwen3_no_think:
             return dataset
 
         def add_no_think(example):
@@ -148,7 +151,7 @@ def _ensure_prompt_only_dataset(
         return dataset.map(add_no_think, num_proc=dataset_num_proc)
 
     def build_prompt(content: str) -> list[dict[str, str]]:
-        if enable_thinking:
+        if enable_thinking or not qwen3_no_think:
             return [{"role": "user", "content": content}]
         return [
             {"role": "system", "content": "/no_think"},
@@ -174,7 +177,9 @@ def _ensure_prompt_only_dataset(
     return dataset.map(make_prompt, num_proc=dataset_num_proc)
 
 
-def _load_dataset_splits(script_args: OPDScriptArguments) -> tuple[Dataset, Dataset | None]:
+def _load_dataset_splits(
+    script_args: OPDScriptArguments, qwen3_no_think: bool = False
+) -> tuple[Dataset, Dataset | None]:
     split_names: list[str] = [script_args.dataset_train_split]
     load_eval = script_args.dataset_eval_split is not None and script_args.dataset_eval_split.lower() != "none"
     if load_eval:
@@ -192,11 +197,11 @@ def _load_dataset_splits(script_args: OPDScriptArguments) -> tuple[Dataset, Data
         eval_dataset = None
 
     train_dataset = _ensure_prompt_only_dataset(
-        train_dataset, script_args.dataset_num_proc, script_args.enable_thinking
+        train_dataset, script_args.dataset_num_proc, script_args.enable_thinking, qwen3_no_think
     )
     if eval_dataset is not None:
         eval_dataset = _ensure_prompt_only_dataset(
-            eval_dataset, script_args.dataset_num_proc, script_args.enable_thinking
+            eval_dataset, script_args.dataset_num_proc, script_args.enable_thinking, qwen3_no_think
         )
     return train_dataset, eval_dataset
 
@@ -215,9 +220,24 @@ def _resolve_processing_class_name(model_name_or_path: str) -> str:
     return model_name_or_path
 
 
+def _is_qwen3_model_name(name: str | None) -> bool:
+    return bool(name) and ("Qwen3-" in name or "/Qwen3" in name)
+
+
+def _use_qwen3_no_think(script_args: OPDScriptArguments, model_name_or_path: str) -> bool:
+    return (
+        not script_args.enable_thinking
+        and (
+            _is_qwen3_model_name(model_name_or_path)
+            or _is_qwen3_model_name(script_args.tokenizer_name_or_path)
+        )
+    )
+
+
 if __name__ == "__main__":
     parser = TrlParser((OPDScriptArguments, MiniLLMConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
+    qwen3_no_think = _use_qwen3_no_think(script_args, model_args.model_name_or_path)
 
     os.environ.setdefault("WANDB_PROJECT", script_args.wandb_project)
 
@@ -273,7 +293,7 @@ if __name__ == "__main__":
     if training_args.max_completion_length is None:
         training_args.max_completion_length = 4096
 
-    if not script_args.enable_thinking:
+    if qwen3_no_think:
         chat_template_kwargs = dict(training_args.chat_template_kwargs or {})
         chat_template_kwargs.setdefault("enable_thinking", False)
         training_args.chat_template_kwargs = chat_template_kwargs
@@ -287,7 +307,7 @@ if __name__ == "__main__":
     training_args.num_iterations = 1
     training_args.temperature = 1.0
 
-    train_dataset, eval_dataset = _load_dataset_splits(script_args)
+    train_dataset, eval_dataset = _load_dataset_splits(script_args, qwen3_no_think)
     tokenizer_name_or_path = (
         script_args.tokenizer_name_or_path.strip() if script_args.tokenizer_name_or_path else None
     )
@@ -314,7 +334,7 @@ if __name__ == "__main__":
         processing_class=processing_class,
         peft_config=get_peft_config(model_args),
     )
-    if not script_args.enable_thinking:
+    if qwen3_no_think:
         trainer.chat_template = qwen3_training_chat_template
     _attach_token_debug_dump(trainer, training_args.output_dir)
 

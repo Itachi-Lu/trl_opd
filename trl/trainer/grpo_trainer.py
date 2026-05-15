@@ -329,6 +329,7 @@ class GRPOTrainer(_BaseTrainer):
         self.pad_token = tokenizer.pad_token
         self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
+        self.mask_terminal_tokens = args.mask_terminal_tokens
         self.terminal_token_ids = list(
             dict.fromkeys(token_id for token_id in [self.eos_token_id, self.pad_token_id] if token_id is not None)
         )
@@ -1180,7 +1181,7 @@ class GRPOTrainer(_BaseTrainer):
     def _mask_terminal_tokens(
         self, completion_ids: torch.Tensor, completion_mask: torch.Tensor
     ) -> torch.Tensor:
-        if not self.terminal_token_ids or completion_ids.size(1) == 0:
+        if not self.mask_terminal_tokens or not self.terminal_token_ids or completion_ids.size(1) == 0:
             return completion_mask
 
         valid_lengths = completion_mask.sum(dim=1)
